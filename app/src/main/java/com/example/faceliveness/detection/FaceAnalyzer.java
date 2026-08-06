@@ -43,8 +43,8 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     // Challenge detection thresholds
     private static final float BLINK_THRESHOLD = 0.2f;
     private static final float SMILE_THRESHOLD = 0.7f;
-    private static final float TURN_LEFT_THRESHOLD = -25f;
-    private static final float TURN_RIGHT_THRESHOLD = 25f;
+    private static final float TURN_LEFT_THRESHOLD = 25f;
+    private static final float TURN_RIGHT_THRESHOLD = -25f;
     private static final float NOD_DOWN_THRESHOLD = 15f;
     private static final float NOD_UP_THRESHOLD = -5f;
     private static final int FRAMES_REQUIRED = 3;
@@ -237,14 +237,14 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
 
     private boolean evaluateTurnLeft(Face face) {
         float yaw = face.getHeadEulerAngleY();
-        boolean result = yaw < TURN_LEFT_THRESHOLD;
+        boolean result = yaw > TURN_LEFT_THRESHOLD;
         Log.d(TAG, "TurnLeft — yaw:" + yaw + " = " + result);
         return result;
     }
 
     private boolean evaluateTurnRight(Face face) {
         float yaw = face.getHeadEulerAngleY();
-        boolean result = yaw > TURN_RIGHT_THRESHOLD;
+        boolean result = yaw < TURN_RIGHT_THRESHOLD;
         Log.d(TAG, "TurnRight — yaw:" + yaw + " = " + result);
         return result;
     }
