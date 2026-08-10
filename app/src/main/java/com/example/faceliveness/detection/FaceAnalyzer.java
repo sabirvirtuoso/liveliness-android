@@ -52,7 +52,16 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     // Run pixel analysis every N frames (not every frame — saves CPU)
     private static final int PIXEL_ANALYSIS_INTERVAL = 5;
 
-    private final Consumer<Face> onFaceDetected;
+    // Minimum face-box width as a fraction of the raw sensor frame width.
+    // Below this, the face is treated as too far away for reliable spoof
+    // detection (see ScreenReplayDetector's periodicity check, whose accuracy
+    // degrades at distance) and challenge progression is paused until the
+    // user moves closer. This is computed independently of — but should be
+    // kept roughly in sync with — FaceOverlayView.MIN_FACE_WIDTH_RATIO, which
+    // only drives the UI hint and has no enforcement power on its own.
+    private static final float MIN_FACE_WIDTH_RATIO = 0.40f;
+
+    private final BiConsumer<Face, Boolean> onFaceDetected;
     private final BiConsumer<ChallengeType, Boolean> onChallengeValidated;
     private final Consumer<String> onSpoofDetected;
 
@@ -71,7 +80,14 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     private int frameCount = 0;
     private boolean spoofAlreadyReported = false;
 
-    public FaceAnalyzer(Consumer<Face> onFaceDetected,
+    /**
+     * @param onFaceDetected fires every frame with the detected face (or null)
+     *                       and whether it's too far away for reliable passive
+     *                       checks — this is the single authoritative distance
+     *                       verdict; UI code should reflect it rather than
+     *                       recomputing its own approximation.
+     */
+    public FaceAnalyzer(BiConsumer<Face, Boolean> onFaceDetected,
                          BiConsumer<ChallengeType, Boolean> onChallengeValidated,
                          Consumer<String> onSpoofDetected) {
         this.onFaceDetected = onFaceDetected;
@@ -107,13 +123,23 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
         frameCount++;
         InputImage image = InputImage.fromMediaImage(imageProxy.getImage(), imageProxy.getImageInfo().getRotationDegrees());
 
+        // Raw Y-plane (luma) bytes, read BEFORE the JPEG conversion below —
+        // imageProxyToBitmap() consumes the original Y buffer's position via
+        // yBuffer.get(...), so duplicate()-ing it here must happen first, or
+        // the duplicate would already be exhausted (remaining() == 0).
+        // ScreenReplayDetector needs this unmangled sensor data, since JPEG's
+        // own 8x8 DCT blocking would otherwise swamp the moire/aliasing signal.
+        final boolean sampleThisFrame = frameCount % PIXEL_ANALYSIS_INTERVAL == 0;
+        final YPlaneData yPlaneData = sampleThisFrame ? extractYPlane(imageProxy) : null;
+
         // Convert to bitmap for pixel analysis (only every N frames)
         final Bitmap bitmap = (frameCount % PIXEL_ANALYSIS_INTERVAL == 0) ? imageProxyToBitmap(imageProxy) : null;
 
         detector.process(image)
                 .addOnSuccessListener(faces -> {
                     Face face = faces.isEmpty() ? null : faces.get(0);
-                    onFaceDetected.accept(face);
+                    boolean isTooFar = face != null && isFaceTooFar(face, imageProxy);
+                    onFaceDetected.accept(face, isTooFar);
 
                     if (face != null) {
                         // ── Passive checks (run every frame with face) ──────────────
@@ -123,7 +149,18 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                         if (bitmap != null) {
                             Rect scaledBounds = scaleBoundsToRotatedBitmap(face.getBoundingBox(), imageProxy, bitmap);
                             antiSpoofAnalyzer.analyzeFrame(bitmap, scaledBounds);
-                            screenReplayDetector.analyzeFrame(bitmap);
+                            //screenReplayDetector.analyzeFrame(bitmap);
+                        }
+
+                        if (yPlaneData != null && !isTooFar) {
+                            // Deliberately skip feeding this detector while the face is
+                            // too far away: its periodicity signal degrades at distance
+                            // (verified empirically), so frames captured out of range
+                            // would just dilute the rolling-window majority vote with
+                            // unreliable non-detections — letting an attacker suppress
+                            // the check simply by holding the replay screen farther back.
+                            screenReplayDetector.analyzeFrame(yPlaneData.bytes, yPlaneData.width,
+                                    yPlaneData.height, yPlaneData.rowStride, yPlaneData.pixelStride);
                         }
 
                         // Check if passive checks have flagged a spoof
@@ -133,7 +170,11 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
 
                         // ── Challenge evaluation ────────────────────────────────────
                         LivenessChallenge challenge = activeChallenge;
-                        if (challenge != null) {
+                        if (challenge != null && !isTooFar) {
+                            // Progression is paused (not reset — see evaluateChallenge's
+                            // own NOD-phase handling) while out of range, so a user can't
+                            // rack up consecutive frames from a distance where detection
+                            // is unreliable, then step back only to claim a pass.
                             evaluateChallenge(face, challenge);
                         } else {
                             consecutiveFrames = 0;
@@ -147,6 +188,24 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                     if (bitmap != null) bitmap.recycle();
                     imageProxy.close();
                 });
+    }
+
+    /**
+     * True when the face bounding box is too small relative to the raw sensor
+     * frame to trust distance-sensitive passive checks (see ScreenReplayDetector).
+     * Uses ML Kit's own bounding-box coordinate space (imageProxy width), not
+     * any UI view dimension — this is the authoritative check; FaceOverlayView's
+     * own ratio only drives what the user sees and has no enforcement power.
+     */
+    private boolean isFaceTooFar(Face face, ImageProxy imageProxy) {
+        int frameWidth = imageProxy.getWidth();
+        if (frameWidth <= 0) return false;
+        Rect bounds = face.getBoundingBox();
+        float widthRatio = (bounds.right - bounds.left) / (float) frameWidth;
+
+        Log.d(TAG, String.format(Locale.US, "Face - widthRatio:%.2f", widthRatio));
+
+        return widthRatio < MIN_FACE_WIDTH_RATIO;
     }
 
     // ─── Passive Spoof Signal Aggregation ────────────────────────────────────────
@@ -167,7 +226,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
         ScreenReplayDetector.SpoofSignal replaySignal = screenReplayDetector.getSpoofSignal();
 
         if(replaySignal.isSuspected) {
-            // Moire/flicker artifacts are a direct signal that the capture medium
+            // Signal periodicity artifacts are a direct signal that the capture medium
             // itself is a screen — this catches video replay, which staticDetected
             // (movement-based) and textureSignal (skin-texture-based) both miss,
             // since a video of a real face has real movement and real skin texture.
@@ -268,6 +327,47 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                 return pitch < NOD_UP_THRESHOLD;
             default:
                 return false;
+        }
+    }
+
+    /** Raw luma plane snapshot, avoiding the JPEG round-trip for detectors that only need luminance. */
+    private static final class YPlaneData {
+        final byte[] bytes;
+        final int width, height, rowStride, pixelStride;
+
+        YPlaneData(byte[] bytes, int width, int height, int rowStride, int pixelStride) {
+            this.bytes = bytes;
+            this.width = width;
+            this.height = height;
+            this.rowStride = rowStride;
+            this.pixelStride = pixelStride;
+        }
+    }
+
+    /**
+     * Extracts the raw Y-plane bytes straight from the sensor, with no JPEG
+     * encoding involved. Uses buffer.duplicate() so reading here doesn't
+     * advance the position of the buffer imageProxyToBitmap() reads
+     * separately via its own image.getPlanes()[0].getBuffer() call —
+     * both calls return the SAME underlying ByteBuffer instance, so an
+     * un-duplicated read here would leave it exhausted for that later read.
+     */
+    @OptIn(markerClass = ExperimentalGetImage.class)
+    private YPlaneData extractYPlane(ImageProxy imageProxy) {
+        try {
+            Image image = imageProxy.getImage();
+            if (image == null) return null;
+
+            Image.Plane plane = image.getPlanes()[0];
+            ByteBuffer buffer = plane.getBuffer().duplicate();
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+
+            return new YPlaneData(bytes, image.getWidth(), image.getHeight(),
+                    plane.getRowStride(), plane.getPixelStride());
+        } catch (Exception e) {
+            Log.w(TAG, "Y-plane extraction failed: " + e.getMessage());
+            return null;
         }
     }
 

@@ -26,10 +26,14 @@ public class FaceOverlayView extends View {
 
     private boolean isFaceDetected = false;
     private boolean isChallengePassed = false;
+    private boolean isFaceTooFar = false;
 
     private final Paint boxPaint = new Paint();
     private final Paint ovalPaint = new Paint();
     private final Paint fillPaint = new Paint();
+    private final Paint warningBoxPaint = new Paint();
+    private final Paint warningTextPaint = new Paint();
+
 
     // Reused across onDraw() calls to avoid per-frame allocation (see onDraw / onSizeChanged)
     private final RectF ovalRect = new RectF();
@@ -56,6 +60,31 @@ public class FaceOverlayView extends View {
 
         fillPaint.setStyle(Paint.Style.FILL);
         fillPaint.setColor(Color.argb(30, 255, 255, 255));
+
+        warningBoxPaint.setStyle(Paint.Style.STROKE);
+        warningBoxPaint.setStrokeWidth(4f);
+        warningBoxPaint.setColor(Color.parseColor("#F44336")); // red — overrides normal box color
+
+        warningTextPaint.setStyle(Paint.Style.FILL);
+        warningTextPaint.setColor(Color.parseColor("#F44336"));
+        warningTextPaint.setTextSize(42f);
+        warningTextPaint.setTextAlign(Paint.Align.CENTER);
+        warningTextPaint.setFakeBoldText(true);
+    }
+
+    /**
+     * Sets whether the face is too far away for reliable detection, as
+     * determined authoritatively by FaceAnalyzer (raw sensor coordinate
+     * space) — not computed locally here, so the UI and the actual
+     * challenge/spoof enforcement can never disagree.
+     */
+    public void setTooFar(boolean tooFar) {
+        isFaceTooFar = tooFar;
+        postInvalidate();
+    }
+
+    public boolean isFaceTooFar() {
+        return isFaceTooFar;
     }
 
     public void updateFace(@Nullable Face detectedFace, int width, int height) {
@@ -124,7 +153,11 @@ public class FaceOverlayView extends View {
                     bounds.right * scaleX,
                     bounds.bottom * scaleY);
 
-            canvas.drawRect(scaledRect, boxPaint);
+            canvas.drawRect(scaledRect, isFaceTooFar ? warningBoxPaint : boxPaint);
+
+            if (isFaceTooFar) {
+                canvas.drawText("Move closer", getWidth() / 2f, ovalRect.top - 24f, warningTextPaint);
+            }
         }
     }
 }

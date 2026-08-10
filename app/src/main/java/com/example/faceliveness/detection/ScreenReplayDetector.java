@@ -1,6 +1,5 @@
 package com.example.faceliveness.detection;
 
-import android.graphics.Bitmap;
 import android.util.Log;
 
 import java.util.ArrayDeque;
@@ -17,21 +16,48 @@ import java.util.Locale;
  * texture and color, because the footage itself is real — only the CAPTURE
  * MEDIUM (a screen, recaptured by our camera) is fake.
  *
- * This class instead looks for artifacts of the capture medium itself:
+ * This class instead looks for artifacts of the capture medium itself, using
+ * the RAW Y-plane (luma) bytes directly from CameraX — not a JPEG-recompressed
+ * Bitmap. JPEG's 8x8 DCT blocking introduces its own structured high-frequency
+ * energy into every frame regardless of content, which swamps the actual
+ * moire signal if you analyze a JPEG-derived bitmap instead of the sensor data.
  *
- * 1. MOIRE / HIGH-FREQUENCY ALIASING — recapturing one pixel grid (a display)
- *    with another pixel grid (the camera sensor) produces fine repeating
- *    interference patterns that don't occur when photographing real skin
- *    under normal lighting. Approximated here via discrete-Laplacian
- *    high-frequency energy over the FULL frame — not just the face crop,
- *    since this artifact is often clearer on the screen's bezel/background
- *    than on the recaptured face itself.
+ * 1. PERIODICITY (primary signal) — recapturing one pixel grid (a display)
+ *    with another pixel grid (the camera sensor) produces a genuinely
+ *    REPEATING interference pattern (moire), not just generic high-frequency
+ *    detail. Raw high-frequency ENERGY alone (an earlier version of this
+ *    class) can't separate that from ordinary skin texture/sensor noise,
+ *    which also carries plenty of broadband high-frequency energy — in
+ *    practice their energy ranges overlap heavily and shift with distance,
+ *    since moire strength itself is non-monotonic with distance (it only
+ *    appears within a "beat frequency" window between the two grids).
+ *    Periodicity is the actual distinguishing property: a horizontal luma
+ *    profile is detrended and autocorrelated: a strong secondary peak in the
+ *    autocorrelation means the signal repeats every N pixels, which is what
+ *    a pixel-grid interference pattern does and ordinary texture does not.
+ *    Being a normalized correlation coefficient, this is far less sensitive
+ *    to absolute brightness/gain/distance than a raw energy threshold.
  *
- * 2. TEMPORAL BRIGHTNESS FLICKER — LCD/OLED panels refresh at a fixed rate
- *    and, combined with rolling-shutter capture, tend to imprint a periodic
- *    frame-to-frame brightness oscillation that stable ambient lighting on
- *    real skin does not produce. Approximated here via the variance of
- *    frame-to-frame brightness deltas over a rolling window.
+ * 2. FRAME-TO-FRAME BRIGHTNESS VOLATILITY — tracked via variance of brightness
+ *    deltas over a rolling window. Honest caveat: at the sampling rate this
+ *    runs at (roughly every 5th camera frame, ~6Hz effective), this CANNOT
+ *    resolve true display refresh rates (50-120Hz) by Nyquist — a claim of
+ *    "refresh-rate flicker detection" would be overstating what this measures.
+ *    What it actually captures is generic brightness volatility: AE/AWB
+ *    convergence, hand shake, mains-frequency lighting beat, and — usefully —
+ *    scene-content brightness changes from a video actually playing (a real
+ *    face under stable room light won't swing much frame to frame; a video's
+ *    content can). Treat this as a weak supplementary signal, not a reliable
+ *    standalone one.
+ *
+ * Raw Laplacian energy is still computed and logged for comparison, but is
+ * NOT used in the suspicion decision — see the class discussion above for why.
+ *
+ * All thresholds below are placeholders and MUST be calibrated per target
+ * device from real logged data (see analyzeFrame's Log.d output) — comparing
+ * genuine-face sessions against actual replay-attack sessions on the same
+ * hardware, since absolute values vary substantially by sensor, ISP, and
+ * lighting and cannot be guessed correctly in the abstract.
  *
  * Note: this is a heuristic layer, not a trained ML model, same as
  * PassiveAntiSpoofAnalyzer — it raises suspicion scores, and should feed
@@ -48,16 +74,32 @@ public class ScreenReplayDetector {
     // too slow to run inside a live camera pipeline.
     private static final int SAMPLE_STEP = 6;
 
-    // Laplacian energy above this = suspiciously fine repeating detail,
-    // consistent with a recaptured pixel grid (moire/aliasing).
+    // PLACEHOLDER — calibrate from real Log.d output on target device(s).
+    // Kept for logging/comparison only — see class doc for why raw energy
+    // alone doesn't reliably separate real faces from screen replay.
     private static final float MOIRE_ENERGY_THRESHOLD = 900f;
+
+    // --- Periodicity detection (primary signal) ---
+    // Finer x-sampling than SAMPLE_STEP: moire periods can be as small as a
+    // handful of pixels, so this needs denser sampling than the coarse energy scan.
+    private static final int PROFILE_STEP = 2;
+    // Box-filter window used to detrend the profile (remove slow lighting
+    // gradients) before autocorrelation. Must be odd.
+    private static final int DETREND_WINDOW = 21;
+    // Lag range (in profile samples) to search for a periodic peak.
+    private static final int MIN_LAG = 3;
+    private static final int MAX_LAG = 60;
+    // PLACEHOLDER — calibrate from real Log.d output. Normalized autocorrelation
+    // (0..1) above this = a repeating pattern was found, consistent with
+    // pixel-grid interference rather than ordinary texture/noise.
+    private static final float PERIODICITY_THRESHOLD = 0.35f;
 
     // How many recent frames' mean brightness we track for flicker analysis.
     private static final int FLICKER_WINDOW = 12;
 
+    // PLACEHOLDER — calibrate from real Log.d output on target device(s).
     // Variance of frame-to-frame brightness deltas above this = suspicious
-    // oscillation, consistent with a display's refresh cycle beating against
-    // the camera's rolling shutter.
+    // volatility (see class doc caveat — this is not true refresh-rate detection).
     private static final float FLICKER_VARIANCE_THRESHOLD = 6.5f;
 
     // Number of frames to accumulate before making a session-level verdict.
@@ -82,30 +124,42 @@ public class ScreenReplayDetector {
     private final ArrayDeque<Float> recentBrightness = new ArrayDeque<>(FLICKER_WINDOW);
 
     /**
-     * Analyze one full camera frame for screen-replay artifacts.
-     * Unlike PassiveAntiSpoofAnalyzer, this intentionally looks at the WHOLE
-     * frame rather than just the face crop.
+     * Analyze one full camera frame for screen-replay artifacts, reading
+     * directly from the raw Y-plane (luma) bytes CameraX hands us — no JPEG
+     * round-trip, so no compression-block artifacts inflating the signal.
+     *
+     * @param yPlane    raw luma bytes from ImageProxy's plane[0]
+     * @param width     image width in pixels
+     * @param height    image height in pixels
+     * @param rowStride bytes per row in yPlane (may exceed width due to padding)
+     * @param pixelStride bytes per pixel in yPlane (usually 1 for Y planes)
      */
-    public void analyzeFrame(Bitmap bitmap) {
+    public void analyzeFrame(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
         try {
-            float moireEnergy = computeMoireEnergy(bitmap);
-            float flickerVariance = updateAndComputeFlicker(bitmap);
+            float moireEnergy = computeMoireEnergy(yPlane, width, height, rowStride, pixelStride);
+            float periodicityH = computePeriodicity(buildHorizontalProfile(yPlane, width, height, rowStride, pixelStride));
+            float periodicityV = computePeriodicity(buildVerticalProfile(yPlane, width, height, rowStride, pixelStride));
+            float periodicity = Math.max(periodicityH, periodicityV);
+            float flickerVariance = updateAndComputeFlicker(yPlane, width, height, rowStride, pixelStride);
 
-            boolean isMoireSuspicious = moireEnergy > MOIRE_ENERGY_THRESHOLD;
+            boolean isPeriodicitySuspicious = periodicity > PERIODICITY_THRESHOLD;
             boolean isFlickerSuspicious = flickerVariance > FLICKER_VARIANCE_THRESHOLD;
-            boolean isSuspicious = isMoireSuspicious || isFlickerSuspicious;
+//            boolean isSuspicious = isPeriodicitySuspicious || isFlickerSuspicious;
+            boolean isSuspicious = isPeriodicitySuspicious;
 
             String reason;
-            if (isMoireSuspicious) {
-                reason = String.format(Locale.US, "Moire/aliasing pattern detected (energy=%.1f)", moireEnergy);
+            if (isPeriodicitySuspicious) {
+                reason = String.format(Locale.US, "Repeating pixel-grid pattern detected (periodicity=%.2f, h=%.2f v=%.2f)",
+                        periodicity, periodicityH, periodicityV);
             } else if (isFlickerSuspicious) {
-                reason = String.format(Locale.US, "Screen-like brightness flicker (var=%.2f)", flickerVariance);
+                reason = String.format(Locale.US, "Screen-like brightness volatility (var=%.2f)", flickerVariance);
             } else {
                 reason = "No screen-replay artifacts";
             }
 
-            Log.d(TAG, String.format(Locale.US, "Frame - moire:%.1f flicker:%.2f suspicious:%b (%s)",
-                    moireEnergy, flickerVariance, isSuspicious, reason));
+            Log.d(TAG, String.format(Locale.US,
+                    "Frame - periodicity:%.2f(h=%.2f,v=%.2f) energy:%.1f flicker:%.2f suspicious:%b (%s)",
+                    periodicity, periodicityH, periodicityV, moireEnergy, flickerVariance, isSuspicious, reason));
 
             recentFrameResults.addLast(isSuspicious);
             if (recentFrameResults.size() > FRAMES_FOR_VERDICT) {
@@ -147,16 +201,18 @@ public class ScreenReplayDetector {
 
     // --- Internal Analysis --------------------------------------------------------
 
+    private int yAt(byte[] data, int x, int y, int rowStride, int pixelStride) {
+        return data[y * rowStride + x * pixelStride] & 0xFF;
+    }
+
     /**
      * Approximates high-frequency energy across the full frame using a 3x3
-     * discrete Laplacian kernel on sampled luminance values. Real skin under
-     * normal lighting has smooth local gradients; a recaptured pixel grid
-     * introduces fine repeating high-frequency structure that spikes this value.
+     * discrete Laplacian kernel on sampled raw luma values (no JPEG in the
+     * path). Real skin under normal lighting has smooth local gradients; a
+     * recaptured pixel grid introduces fine repeating high-frequency
+     * structure that spikes this value.
      */
-    private float computeMoireEnergy(Bitmap bitmap) {
-        int width = bitmap.getWidth();
-        int height = bitmap.getHeight();
-
+    private float computeMoireEnergy(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
         long sumSq = 0L;
         int count = 0;
 
@@ -164,11 +220,11 @@ public class ScreenReplayDetector {
         // 4-neighbor kernel never reads out of bounds.
         for (int y = SAMPLE_STEP; y < height - SAMPLE_STEP; y += SAMPLE_STEP) {
             for (int x = SAMPLE_STEP; x < width - SAMPLE_STEP; x += SAMPLE_STEP) {
-                float center = luminance(bitmap.getPixel(x, y));
-                float left = luminance(bitmap.getPixel(x - SAMPLE_STEP, y));
-                float right = luminance(bitmap.getPixel(x + SAMPLE_STEP, y));
-                float up = luminance(bitmap.getPixel(x, y - SAMPLE_STEP));
-                float down = luminance(bitmap.getPixel(x, y + SAMPLE_STEP));
+                float center = yAt(yPlane, x, y, rowStride, pixelStride);
+                float left = yAt(yPlane, x - SAMPLE_STEP, y, rowStride, pixelStride);
+                float right = yAt(yPlane, x + SAMPLE_STEP, y, rowStride, pixelStride);
+                float up = yAt(yPlane, x, y - SAMPLE_STEP, rowStride, pixelStride);
+                float down = yAt(yPlane, x, y + SAMPLE_STEP, rowStride, pixelStride);
 
                 // Discrete Laplacian: 4*center - sum(neighbors)
                 float laplacian = 4 * center - (left + right + up + down);
@@ -182,11 +238,12 @@ public class ScreenReplayDetector {
 
     /**
      * Tracks mean full-frame brightness across a short rolling window and
-     * returns the variance of frame-to-frame brightness deltas — a proxy for
-     * flicker/oscillation that stable ambient lighting on real skin does not produce.
+     * returns the variance of frame-to-frame brightness deltas. See class
+     * doc for why this is a weak, supplementary signal rather than true
+     * refresh-rate detection at this sampling rate.
      */
-    private float updateAndComputeFlicker(Bitmap bitmap) {
-        float meanBrightness = computeMeanBrightness(bitmap);
+    private float updateAndComputeFlicker(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
+        float meanBrightness = computeMeanBrightness(yPlane, width, height, rowStride, pixelStride);
 
         recentBrightness.addLast(meanBrightness);
         if (recentBrightness.size() > FLICKER_WINDOW) {
@@ -212,25 +269,105 @@ public class ScreenReplayDetector {
         return sqSum / deltas.length;
     }
 
-    private float computeMeanBrightness(Bitmap bitmap) {
-        int width = bitmap.getWidth();
-        int height = bitmap.getHeight();
+    private float computeMeanBrightness(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
         long total = 0L;
         int count = 0;
 
         for (int y = 0; y < height; y += SAMPLE_STEP) {
             for (int x = 0; x < width; x += SAMPLE_STEP) {
-                total += (long) luminance(bitmap.getPixel(x, y));
+                total += yAt(yPlane, x, y, rowStride, pixelStride);
                 count++;
             }
         }
         return count == 0 ? 0f : (float) total / count;
     }
 
-    private float luminance(int pixel) {
-        int r = (pixel >> 16) & 0xFF;
-        int g = (pixel >> 8) & 0xFF;
-        int b = pixel & 0xFF;
-        return 0.299f * r + 0.587f * g + 0.114f * b;
+    /**
+     * Builds a 1D horizontal luma profile by averaging a handful of evenly
+     * spaced rows column-by-column. Averaging several rows suppresses
+     * per-row sensor noise while still preserving any horizontal periodicity
+     * that's consistent across those rows (as pixel-grid interference would be).
+     */
+    private float[] buildHorizontalProfile(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
+        int numSampleRows = 5;
+        int profileLen = width / PROFILE_STEP;
+        float[] profile = new float[profileLen];
+
+        for (int r = 0; r < numSampleRows; r++) {
+            int y = (height * (r + 1)) / (numSampleRows + 1); // evenly spaced, avoiding edges
+            for (int i = 0; i < profileLen; i++) {
+                profile[i] += yAt(yPlane, i * PROFILE_STEP, y, rowStride, pixelStride);
+            }
+        }
+        for (int i = 0; i < profileLen; i++) {
+            profile[i] /= numSampleRows;
+        }
+        return profile;
     }
+
+    /** Same idea as buildHorizontalProfile, but sampling columns down the image instead. */
+    private float[] buildVerticalProfile(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
+        int numSampleCols = 5;
+        int profileLen = height / PROFILE_STEP;
+        float[] profile = new float[profileLen];
+
+        for (int c = 0; c < numSampleCols; c++) {
+            int x = (width * (c + 1)) / (numSampleCols + 1);
+            for (int i = 0; i < profileLen; i++) {
+                profile[i] += yAt(yPlane, x, i * PROFILE_STEP, rowStride, pixelStride);
+            }
+        }
+        for (int i = 0; i < profileLen; i++) {
+            profile[i] /= numSampleCols;
+        }
+        return profile;
+    }
+
+    /**
+     * Detrends a 1D profile (removes the slow-varying lighting gradient via a
+     * box-filter moving average) and returns the strongest normalized
+     * autocorrelation coefficient found across MIN_LAG..MAX_LAG.
+     *
+     * A real, non-periodic signal (skin texture, sensor noise) decays toward
+     * zero correlation as lag increases, with no standout peak. A genuinely
+     * periodic signal (pixel-grid interference) produces a distinct peak at
+     * the lag matching its period — that peak is what we're detecting, not
+     * the signal's raw amplitude, which is why this is far less sensitive to
+     * distance/brightness than the energy measure above.
+     */
+    private float computePeriodicity(float[] profile) {
+        int n = profile.length;
+        if (n < DETREND_WINDOW * 2) return 0f;
+
+        // Detrend: subtract a centered moving average from each sample.
+        float[] detrended = new float[n];
+        int half = DETREND_WINDOW / 2;
+        for (int i = 0; i < n; i++) {
+            int lo = Math.max(0, i - half);
+            int hi = Math.min(n - 1, i + half);
+            float sum = 0f;
+            for (int j = lo; j <= hi; j++) sum += profile[j];
+            float localMean = sum / (hi - lo + 1);
+            detrended[i] = profile[i] - localMean;
+        }
+
+        // Zero-lag autocorrelation (= variance of the detrended signal),
+        // used to normalize every other lag into a -1..1 correlation coefficient.
+        double zeroLag = 0.0;
+        for (float v : detrended) zeroLag += (double) v * v;
+        if (zeroLag < 1e-6) return 0f; // flat signal, nothing to correlate
+
+        float maxCorr = 0f;
+        int maxLag = Math.min(MAX_LAG, n / 2);
+        for (int lag = MIN_LAG; lag < maxLag; lag++) {
+            double sum = 0.0;
+            for (int i = 0; i < n - lag; i++) {
+                sum += (double) detrended[i] * detrended[i + lag];
+            }
+            float corr = (float) (sum / zeroLag);
+            if (corr > maxCorr) maxCorr = corr;
+        }
+        return maxCorr;
+    }
+
 }

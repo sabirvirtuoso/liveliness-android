@@ -63,7 +63,7 @@ public class LivenessActivity extends AppCompatActivity {
 
     private void setupFaceAnalyzer() {
         faceAnalyzer = new FaceAnalyzer(
-                face -> runOnUiThread(() -> {
+                (face, isTooFar) -> runOnUiThread(() -> {
                     // In-flight ML Kit detections can complete and post here after
                     // onDestroy() has already run (e.g. rotation, back press mid-frame).
                     // binding/viewModel are still valid Java references at that point —
@@ -73,6 +73,10 @@ public class LivenessActivity extends AppCompatActivity {
 
                     PreviewView previewView = binding.previewView;
                     binding.faceOverlay.updateFace(face, previewView.getWidth(), previewView.getHeight());
+                    // isTooFar comes from FaceAnalyzer's own raw-sensor-space computation —
+                    // the single source of truth that also gates challenge/spoof processing —
+                    // rather than FaceOverlayView recomputing its own screen-space approximation.
+                    binding.faceOverlay.setTooFar(isTooFar);
                     binding.faceOverlay.setStatus(face != null);
                     viewModel.onFaceVisibilityChanged(face != null);
                     faceAnalyzer.setActiveChallenge(viewModel.currentChallenge());
