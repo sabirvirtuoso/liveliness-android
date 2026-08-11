@@ -170,7 +170,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
 
                         // ── Challenge evaluation ────────────────────────────────────
                         LivenessChallenge challenge = activeChallenge;
-                        if (challenge != null && !isTooFar) {
+                        if (challenge != null && !isTooFar && !spoofAlreadyReported) {
                             // Progression is paused (not reset — see evaluateChallenge's
                             // own NOD-phase handling) while out of range, so a user can't
                             // rack up consecutive frames from a distance where detection

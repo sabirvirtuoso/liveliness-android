@@ -174,10 +174,11 @@ public class LivenessActivity extends AppCompatActivity {
     }
 
     private void onSpoofWarningChanged(String warning) {
-        if (warning != null) {
-            binding.tvFaceStatus.setText("⚠ " + warning);
-            binding.tvFaceStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_orange_dark));
-        }
+//        if (warning != null) {
+//            binding.tvFaceStatus.setText("⚠ " + warning);
+//            binding.tvFaceStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_orange_dark));
+//        }
+        binding.faceOverlay.setSpoofWarning(warning);
     }
 
     private void showResult(LivenessResult result) {

@@ -75,12 +75,12 @@ public class LivenessViewModel extends ViewModel {
      * Immediately fails the session — no challenge result can override this.
      */
     public void onSpoofDetected(String reason) {
-        cancelTimer();
+        //cancelTimer();
         spoofWarning.setValue(reason);
-        challengeState.setValue(new ChallengeState.SessionFailed(
-                new LivenessResult(false, new ArrayList<>(completedChallenges), null,
-                        "Spoof attempt detected: " + reason, null)
-        ));
+//        challengeState.setValue(new ChallengeState.SessionFailed(
+//                new LivenessResult(false, new ArrayList<>(completedChallenges), null,
+//                        "Spoof attempt detected: " + reason, null)
+//        ));
     }
 
     /**

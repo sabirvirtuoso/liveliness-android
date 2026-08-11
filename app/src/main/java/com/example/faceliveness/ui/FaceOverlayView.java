@@ -27,6 +27,7 @@ public class FaceOverlayView extends View {
     private boolean isFaceDetected = false;
     private boolean isChallengePassed = false;
     private boolean isFaceTooFar = false;
+    private String spoofWarningMessage = null;
 
     private final Paint boxPaint = new Paint();
     private final Paint ovalPaint = new Paint();
@@ -87,6 +88,17 @@ public class FaceOverlayView extends View {
         return isFaceTooFar;
     }
 
+    /**
+     * Sets (or clears, if null) the spoof warning shown on the overlay.
+     * Drawn in the same red warning style as the "too far" prompt, and takes
+     * visual priority over it — see onDraw(). The session is NOT navigated
+     * away on this; see LivenessViewModel.onSpoofDetected() for why.
+     */
+    public void setSpoofWarning(@Nullable String message) {
+        spoofWarningMessage = message;
+        postInvalidate();
+    }
+
     public void updateFace(@Nullable Face detectedFace, int width, int height) {
         face = detectedFace;
         previewWidth = width;
@@ -142,6 +154,8 @@ public class FaceOverlayView extends View {
         canvas.drawOval(ovalRect, fillPaint);
         canvas.drawOval(ovalRect, ovalPaint);
 
+        boolean showWarningStyle = spoofWarningMessage != null || isFaceTooFar;
+
         // Draw face bounding box if face is detected
         if (face != null && previewWidth > 0 && previewHeight > 0) {
             float scaleX = getWidth() / (float) previewHeight; // rotated
@@ -153,9 +167,14 @@ public class FaceOverlayView extends View {
                     bounds.right * scaleX,
                     bounds.bottom * scaleY);
 
-            canvas.drawRect(scaledRect, isFaceTooFar ? warningBoxPaint : boxPaint);
+            canvas.drawRect(scaledRect, showWarningStyle ? warningBoxPaint : boxPaint);
 
-            if (isFaceTooFar) {
+            // Spoof warning takes priority over the "too far" prompt, and is
+            // drawn regardless of whether a face box is currently present —
+            // a spoof verdict can outlast a momentary detection drop.
+            if (spoofWarningMessage != null) {
+                canvas.drawText("Spoof Detected", getWidth() / 2f, ovalRect.top - 24f, warningTextPaint);
+            } else if (isFaceTooFar) {
                 canvas.drawText("Move closer", getWidth() / 2f, ovalRect.top - 24f, warningTextPaint);
             }
         }

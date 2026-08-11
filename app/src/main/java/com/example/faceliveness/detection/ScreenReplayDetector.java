@@ -38,6 +38,16 @@ import java.util.Locale;
  *    Being a normalized correlation coefficient, this is far less sensitive
  *    to absolute brightness/gain/distance than a raw energy threshold.
  *
+ *    Searched at TWO spatial scales (fine + coarse profile spacing). Zooming
+ *    into a replay screen enlarges the display's pixel grid as projected
+ *    onto the sensor, which stretches the moire period in raw-pixel terms —
+ *    a single fixed-range search can end up with the true period sitting at
+ *    the edge of (or past) its lag window, producing a weaker, noisier peak
+ *    that takes longer for the rolling majority vote to accumulate on. The
+ *    coarse pass uses a larger per-sample pixel spacing, which covers a much
+ *    larger ABSOLUTE pixel range using the same number of lag steps —
+ *    cheaper than simply widening the fine pass's lag range to match.
+ *
  * 2. FRAME-TO-FRAME BRIGHTNESS VOLATILITY — tracked via variance of brightness
  *    deltas over a rolling window. Honest caveat: at the sampling rate this
  *    runs at (roughly every 5th camera frame, ~6Hz effective), this CANNOT
@@ -80,13 +90,25 @@ public class ScreenReplayDetector {
     private static final float MOIRE_ENERGY_THRESHOLD = 900f;
 
     // --- Periodicity detection (primary signal) ---
-    // Finer x-sampling than SAMPLE_STEP: moire periods can be as small as a
-    // handful of pixels, so this needs denser sampling than the coarse energy scan.
-    private static final int PROFILE_STEP = 2;
+    // Fine scale: dense x-sampling to resolve small moire periods (close-range
+    // replay). Detectable period range: MIN_LAG..MAX_LAG, in raw pixels =
+    // lag * PROFILE_STEP_FINE, i.e. roughly 6-120px.
+    private static final int PROFILE_STEP_FINE = 2;
+    // Coarse scale: sparser x-sampling, covers a much larger raw-pixel period
+    // range with the same lag-step budget — added specifically because
+    // zooming into a replay screen stretches the moire period past what the
+    // fine scale alone can resolve (see class doc). Detectable range: roughly
+    // 24-480px with the same MIN_LAG/MAX_LAG bounds below.
+    private static final int PROFILE_STEP_COARSE = 8;
     // Box-filter window used to detrend the profile (remove slow lighting
-    // gradients) before autocorrelation. Must be odd.
+    // gradients) before autocorrelation. Must be odd. Applied at both scales;
+    // a single shared value is a simplification — in principle the "right"
+    // detrend window scales with PROFILE_STEP too, but this keeps the code
+    // manageable and the effect is second-order compared to the lag-range fix.
     private static final int DETREND_WINDOW = 21;
-    // Lag range (in profile samples) to search for a periodic peak.
+    // Lag range (in profile samples) to search for a periodic peak — shared
+    // by both scales; what changes between them is what each lag unit means
+    // in raw pixels (PROFILE_STEP_FINE vs PROFILE_STEP_COARSE).
     private static final int MIN_LAG = 3;
     private static final int MAX_LAG = 60;
     // PLACEHOLDER — calibrate from real Log.d output. Normalized autocorrelation
@@ -137,9 +159,15 @@ public class ScreenReplayDetector {
     public void analyzeFrame(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
         try {
             float moireEnergy = computeMoireEnergy(yPlane, width, height, rowStride, pixelStride);
-            float periodicityH = computePeriodicity(buildHorizontalProfile(yPlane, width, height, rowStride, pixelStride));
-            float periodicityV = computePeriodicity(buildVerticalProfile(yPlane, width, height, rowStride, pixelStride));
-            float periodicity = Math.max(periodicityH, periodicityV);
+
+            float periodicityFineH = computePeriodicity(buildHorizontalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_FINE));
+            float periodicityFineV = computePeriodicity(buildVerticalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_FINE));
+            float periodicityCoarseH = computePeriodicity(buildHorizontalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_COARSE));
+            float periodicityCoarseV = computePeriodicity(buildVerticalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_COARSE));
+            float periodicity = Math.max(
+                    Math.max(periodicityFineH, periodicityFineV),
+                    Math.max(periodicityCoarseH, periodicityCoarseV));
+
             float flickerVariance = updateAndComputeFlicker(yPlane, width, height, rowStride, pixelStride);
 
             boolean isPeriodicitySuspicious = periodicity > PERIODICITY_THRESHOLD;
@@ -149,8 +177,7 @@ public class ScreenReplayDetector {
 
             String reason;
             if (isPeriodicitySuspicious) {
-                reason = String.format(Locale.US, "Repeating pixel-grid pattern detected (periodicity=%.2f, h=%.2f v=%.2f)",
-                        periodicity, periodicityH, periodicityV);
+                reason = String.format(Locale.US, "Repeating pixel-grid pattern detected (periodicity=%.2f)", periodicity);
             } else if (isFlickerSuspicious) {
                 reason = String.format(Locale.US, "Screen-like brightness volatility (var=%.2f)", flickerVariance);
             } else {
@@ -158,8 +185,9 @@ public class ScreenReplayDetector {
             }
 
             Log.d(TAG, String.format(Locale.US,
-                    "Frame - periodicity:%.2f(h=%.2f,v=%.2f) energy:%.1f flicker:%.2f suspicious:%b (%s)",
-                    periodicity, periodicityH, periodicityV, moireEnergy, flickerVariance, isSuspicious, reason));
+                    "Frame - periodicity:%.2f [fine h=%.2f v=%.2f | coarse h=%.2f v=%.2f] energy:%.1f flicker:%.2f suspicious:%b (%s)",
+                    periodicity, periodicityFineH, periodicityFineV, periodicityCoarseH, periodicityCoarseV,
+                    moireEnergy, flickerVariance, isSuspicious, reason));
 
             recentFrameResults.addLast(isSuspicious);
             if (recentFrameResults.size() > FRAMES_FOR_VERDICT) {
@@ -287,16 +315,19 @@ public class ScreenReplayDetector {
      * spaced rows column-by-column. Averaging several rows suppresses
      * per-row sensor noise while still preserving any horizontal periodicity
      * that's consistent across those rows (as pixel-grid interference would be).
+     *
+     * @param profileStep pixel spacing between profile samples — PROFILE_STEP_FINE
+     *                     or PROFILE_STEP_COARSE, see class doc for why both exist.
      */
-    private float[] buildHorizontalProfile(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
+    private float[] buildHorizontalProfile(byte[] yPlane, int width, int height, int rowStride, int pixelStride, int profileStep) {
         int numSampleRows = 5;
-        int profileLen = width / PROFILE_STEP;
+        int profileLen = width / profileStep;
         float[] profile = new float[profileLen];
 
         for (int r = 0; r < numSampleRows; r++) {
             int y = (height * (r + 1)) / (numSampleRows + 1); // evenly spaced, avoiding edges
             for (int i = 0; i < profileLen; i++) {
-                profile[i] += yAt(yPlane, i * PROFILE_STEP, y, rowStride, pixelStride);
+                profile[i] += yAt(yPlane, i * profileStep, y, rowStride, pixelStride);
             }
         }
         for (int i = 0; i < profileLen; i++) {
@@ -306,15 +337,15 @@ public class ScreenReplayDetector {
     }
 
     /** Same idea as buildHorizontalProfile, but sampling columns down the image instead. */
-    private float[] buildVerticalProfile(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
+    private float[] buildVerticalProfile(byte[] yPlane, int width, int height, int rowStride, int pixelStride, int profileStep) {
         int numSampleCols = 5;
-        int profileLen = height / PROFILE_STEP;
+        int profileLen = height / profileStep;
         float[] profile = new float[profileLen];
 
         for (int c = 0; c < numSampleCols; c++) {
             int x = (width * (c + 1)) / (numSampleCols + 1);
             for (int i = 0; i < profileLen; i++) {
-                profile[i] += yAt(yPlane, x, i * PROFILE_STEP, rowStride, pixelStride);
+                profile[i] += yAt(yPlane, x, i * profileStep, rowStride, pixelStride);
             }
         }
         for (int i = 0; i < profileLen; i++) {
