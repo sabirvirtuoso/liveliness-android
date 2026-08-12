@@ -433,6 +433,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     public void resetAntiSpoof() {
         consistencyChecker.reset();
         antiSpoofAnalyzer.reset();
+        screenReplayDetector.reset();
         spoofAlreadyReported = false;
         frameCount = 0;
     }

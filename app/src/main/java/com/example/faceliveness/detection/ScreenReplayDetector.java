@@ -38,16 +38,6 @@ import java.util.Locale;
  *    Being a normalized correlation coefficient, this is far less sensitive
  *    to absolute brightness/gain/distance than a raw energy threshold.
  *
- *    Searched at TWO spatial scales (fine + coarse profile spacing). Zooming
- *    into a replay screen enlarges the display's pixel grid as projected
- *    onto the sensor, which stretches the moire period in raw-pixel terms —
- *    a single fixed-range search can end up with the true period sitting at
- *    the edge of (or past) its lag window, producing a weaker, noisier peak
- *    that takes longer for the rolling majority vote to accumulate on. The
- *    coarse pass uses a larger per-sample pixel spacing, which covers a much
- *    larger ABSOLUTE pixel range using the same number of lag steps —
- *    cheaper than simply widening the fine pass's lag range to match.
- *
  * 2. FRAME-TO-FRAME BRIGHTNESS VOLATILITY — tracked via variance of brightness
  *    deltas over a rolling window. Honest caveat: at the sampling rate this
  *    runs at (roughly every 5th camera frame, ~6Hz effective), this CANNOT
@@ -90,25 +80,13 @@ public class ScreenReplayDetector {
     private static final float MOIRE_ENERGY_THRESHOLD = 900f;
 
     // --- Periodicity detection (primary signal) ---
-    // Fine scale: dense x-sampling to resolve small moire periods (close-range
-    // replay). Detectable period range: MIN_LAG..MAX_LAG, in raw pixels =
-    // lag * PROFILE_STEP_FINE, i.e. roughly 6-120px.
-    private static final int PROFILE_STEP_FINE = 2;
-    // Coarse scale: sparser x-sampling, covers a much larger raw-pixel period
-    // range with the same lag-step budget — added specifically because
-    // zooming into a replay screen stretches the moire period past what the
-    // fine scale alone can resolve (see class doc). Detectable range: roughly
-    // 24-480px with the same MIN_LAG/MAX_LAG bounds below.
-    private static final int PROFILE_STEP_COARSE = 8;
+    // Finer x-sampling than SAMPLE_STEP: moire periods can be as small as a
+    // handful of pixels, so this needs denser sampling than the coarse energy scan.
+    private static final int PROFILE_STEP = 2;
     // Box-filter window used to detrend the profile (remove slow lighting
-    // gradients) before autocorrelation. Must be odd. Applied at both scales;
-    // a single shared value is a simplification — in principle the "right"
-    // detrend window scales with PROFILE_STEP too, but this keeps the code
-    // manageable and the effect is second-order compared to the lag-range fix.
+    // gradients) before autocorrelation. Must be odd.
     private static final int DETREND_WINDOW = 21;
-    // Lag range (in profile samples) to search for a periodic peak — shared
-    // by both scales; what changes between them is what each lag unit means
-    // in raw pixels (PROFILE_STEP_FINE vs PROFILE_STEP_COARSE).
+    // Lag range (in profile samples) to search for a periodic peak.
     private static final int MIN_LAG = 3;
     private static final int MAX_LAG = 60;
     // PLACEHOLDER — calibrate from real Log.d output. Normalized autocorrelation
@@ -129,6 +107,16 @@ public class ScreenReplayDetector {
 
     // How many of the last N frames must be suspicious to flag.
     private static final int SUSPICIOUS_FRAME_THRESHOLD = 9;
+
+    // Harsh/bright lighting (direct sunlight, strong backlight, a desk lamp
+    // or monitor angled at the face) can sharpen ordinary face/hair texture
+    // into something that autocorrelates more strongly than it should —
+    // confirmed empirically, not just a theoretical risk. Frames this
+    // overexposed are excluded from the periodicity vote entirely rather
+    // than trusted either way — see analyzeFrame(). PLACEHOLDER — calibrate
+    // against real bright-light sessions on target device(s).
+    private static final int CLIP_LUMA_THRESHOLD = 250; // luma value considered "clipped"
+    private static final float CLIPPED_FRACTION_THRESHOLD = 0.15f; // fraction of sampled pixels
 
     public static final class SpoofSignal {
         public final boolean isSuspected;
@@ -158,26 +146,36 @@ public class ScreenReplayDetector {
      */
     public void analyzeFrame(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
         try {
+            float clippedFraction = computeClippedFraction(yPlane, width, height, rowStride, pixelStride);
+
+            if (clippedFraction > CLIPPED_FRACTION_THRESHOLD) {
+                // Excluded entirely — not counted as suspicious OR as clean.
+                // Same principle as FaceAnalyzer's isTooFar exclusion: a
+                // frame we can't trust shouldn't get a vote either way,
+                // rather than being trusted by default (which is what
+                // happens if you only suppress the SUSPICIOUS verdict but
+                // still let the frame count toward the total window size).
+                Log.d(TAG, String.format(Locale.US,
+                        "Frame skipped — overexposed (clipped=%.2f > %.2f), excluded from periodicity vote",
+                        clippedFraction, CLIPPED_FRACTION_THRESHOLD));
+                return;
+            }
+
             float moireEnergy = computeMoireEnergy(yPlane, width, height, rowStride, pixelStride);
-
-            float periodicityFineH = computePeriodicity(buildHorizontalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_FINE));
-            float periodicityFineV = computePeriodicity(buildVerticalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_FINE));
-            float periodicityCoarseH = computePeriodicity(buildHorizontalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_COARSE));
-            float periodicityCoarseV = computePeriodicity(buildVerticalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP_COARSE));
-            float periodicity = Math.max(
-                    Math.max(periodicityFineH, periodicityFineV),
-                    Math.max(periodicityCoarseH, periodicityCoarseV));
-
+            float periodicityH = computePeriodicity(buildHorizontalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP));
+            float periodicityV = computePeriodicity(buildVerticalProfile(yPlane, width, height, rowStride, pixelStride, PROFILE_STEP));
+            float periodicity = Math.max(periodicityH, periodicityV);
             float flickerVariance = updateAndComputeFlicker(yPlane, width, height, rowStride, pixelStride);
 
             boolean isPeriodicitySuspicious = periodicity > PERIODICITY_THRESHOLD;
             boolean isFlickerSuspicious = flickerVariance > FLICKER_VARIANCE_THRESHOLD;
-//            boolean isSuspicious = isPeriodicitySuspicious || isFlickerSuspicious;
+            //boolean isSuspicious = isPeriodicitySuspicious || isFlickerSuspicious;
             boolean isSuspicious = isPeriodicitySuspicious;
 
             String reason;
             if (isPeriodicitySuspicious) {
-                reason = String.format(Locale.US, "Repeating pixel-grid pattern detected (periodicity=%.2f)", periodicity);
+                reason = String.format(Locale.US, "Repeating pixel-grid pattern detected (periodicity=%.2f, h=%.2f v=%.2f)",
+                        periodicity, periodicityH, periodicityV);
             } else if (isFlickerSuspicious) {
                 reason = String.format(Locale.US, "Screen-like brightness volatility (var=%.2f)", flickerVariance);
             } else {
@@ -185,9 +183,8 @@ public class ScreenReplayDetector {
             }
 
             Log.d(TAG, String.format(Locale.US,
-                    "Frame - periodicity:%.2f [fine h=%.2f v=%.2f | coarse h=%.2f v=%.2f] energy:%.1f flicker:%.2f suspicious:%b (%s)",
-                    periodicity, periodicityFineH, periodicityFineV, periodicityCoarseH, periodicityCoarseV,
-                    moireEnergy, flickerVariance, isSuspicious, reason));
+                    "Frame - periodicity:%.2f(h=%.2f,v=%.2f) energy:%.1f flicker:%.2f suspicious:%b (%s)",
+                    periodicity, periodicityH, periodicityV, moireEnergy, flickerVariance, isSuspicious, reason));
 
             recentFrameResults.addLast(isSuspicious);
             if (recentFrameResults.size() > FRAMES_FOR_VERDICT) {
@@ -231,6 +228,28 @@ public class ScreenReplayDetector {
 
     private int yAt(byte[] data, int x, int y, int rowStride, int pixelStride) {
         return data[y * rowStride + x * pixelStride] & 0xFF;
+    }
+
+    /**
+     * Fraction of sampled pixels at or above CLIP_LUMA_THRESHOLD — a proxy
+     * for overexposure (direct sunlight, strong backlight, harsh directional
+     * light). Reuses the same coarse SAMPLE_STEP grid as computeMoireEnergy/
+     * computeMeanBrightness rather than a full-resolution scan, since this
+     * only needs to be a reasonable estimate, not an exact count, and is
+     * checked before the more expensive periodicity computation runs.
+     */
+    private float computeClippedFraction(byte[] yPlane, int width, int height, int rowStride, int pixelStride) {
+        int clipped = 0;
+        int count = 0;
+        for (int y = 0; y < height; y += SAMPLE_STEP) {
+            for (int x = 0; x < width; x += SAMPLE_STEP) {
+                if (yAt(yPlane, x, y, rowStride, pixelStride) >= CLIP_LUMA_THRESHOLD) {
+                    clipped++;
+                }
+                count++;
+            }
+        }
+        return count == 0 ? 0f : (float) clipped / count;
     }
 
     /**
@@ -353,19 +372,18 @@ public class ScreenReplayDetector {
         }
         return profile;
     }
-
-    /**
-     * Detrends a 1D profile (removes the slow-varying lighting gradient via a
-     * box-filter moving average) and returns the strongest normalized
-     * autocorrelation coefficient found across MIN_LAG..MAX_LAG.
-     *
-     * A real, non-periodic signal (skin texture, sensor noise) decays toward
-     * zero correlation as lag increases, with no standout peak. A genuinely
-     * periodic signal (pixel-grid interference) produces a distinct peak at
-     * the lag matching its period — that peak is what we're detecting, not
-     * the signal's raw amplitude, which is why this is far less sensitive to
-     * distance/brightness than the energy measure above.
-     */
+        /**
+         * Detrends a 1D profile (removes the slow-varying lighting gradient via a
+         * box-filter moving average) and returns the strongest normalized
+         * autocorrelation coefficient found across MIN_LAG..MAX_LAG.
+         *
+         * A real, non-periodic signal (skin texture, sensor noise) decays toward
+         * zero correlation as lag increases, with no standout peak. A genuinely
+         * periodic signal (pixel-grid interference) produces a distinct peak at
+         * the lag matching its period — that peak is what we're detecting, not
+         * the signal's raw amplitude, which is why this is far less sensitive to
+         * distance/brightness than the energy measure above.
+         */
     private float computePeriodicity(float[] profile) {
         int n = profile.length;
         if (n < DETREND_WINDOW * 2) return 0f;
