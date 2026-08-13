@@ -28,6 +28,7 @@ public class LivenessActivity extends AppCompatActivity {
 
     private static final String TAG = "LivenessActivity";
     public static final String EXTRA_RESULT = "liveness_result";
+    public static final String EXTRA_MODEL_CONFIDENCE = "liveness_model_confidence";
 
     private ActivityLivenessBinding binding;
     private LivenessViewModel viewModel;
@@ -63,6 +64,7 @@ public class LivenessActivity extends AppCompatActivity {
 
     private void setupFaceAnalyzer() {
         faceAnalyzer = new FaceAnalyzer(
+                this,
                 (face, isTooFar) -> runOnUiThread(() -> {
                     // In-flight ML Kit detections can complete and post here after
                     // onDestroy() has already run (e.g. rotation, back press mid-frame).
@@ -86,7 +88,21 @@ public class LivenessActivity extends AppCompatActivity {
                     
                     viewModel.onChallengeValidated(type, success);
                 },
-                reason -> viewModel.onSpoofDetected(reason)
+                (reason) -> {
+                    if (isDestroyed() || isFinishing()) return;
+
+                    viewModel.onSpoofDetected(reason);
+                },
+                modelResult -> runOnUiThread(() -> {
+                    if (isDestroyed() || isFinishing()) return;
+                    if (!modelResult.isAvailable) {
+                        // Already logged in detail inside MiniFasNetSpoofDetector —
+                        // this is just the UI-facing hand-off.
+                        Log.w(TAG, "Liveness model unavailable: " + modelResult.errorMessage);
+                    }
+                    viewModel.onLivenessModelResult(modelResult.isAvailable, modelResult.livenessScore,
+                            modelResult.errorMessage);
+                })
         );
     }
 
@@ -123,6 +139,13 @@ public class LivenessActivity extends AppCompatActivity {
         viewModel.getTimeRemaining().observe(this, this::onTimeRemainingChanged);
         viewModel.getFaceVisible().observe(this, this::onFaceVisibleChanged);
         viewModel.getSpoofWarning().observe(this, this::onSpoofWarningChanged);
+        viewModel.getSnapshotRequested().observe(this, this::onSnapshotRequestedChanged);
+    }
+
+    private void onSnapshotRequestedChanged(boolean requested) {
+        if (requested) {
+            faceAnalyzer.requestLivenessSnapshot();
+        }
     }
 
     private void onChallengeStateChanged(ChallengeState state) {
@@ -144,6 +167,13 @@ public class LivenessActivity extends AppCompatActivity {
         } else if (state instanceof ChallengeState.ChallengeCompleted) {
             binding.tvInstruction.setText("✓ Done!");
             binding.faceOverlay.setStatus(true, true);
+            faceAnalyzer.setActiveChallenge(null);
+
+        } else if (state instanceof ChallengeState.StillnessCheck) {
+            binding.tvInstruction.setText("Hold still...");
+            binding.tvProgress.setText("");
+            binding.tvTimer.setText("");
+            binding.progressChallenge.setProgress(0);
             faceAnalyzer.setActiveChallenge(null);
 
         } else if (state instanceof ChallengeState.SessionPassed) {
@@ -196,6 +226,9 @@ public class LivenessActivity extends AppCompatActivity {
             binding.btnContinue.setOnClickListener(v -> {
                 Intent intent = new Intent(this, ResultActivity.class);
                 intent.putExtra(EXTRA_RESULT, result.isPassed());
+                if (result.getLivenessModelConfidence() != null) {
+                    intent.putExtra(EXTRA_MODEL_CONFIDENCE, result.getLivenessModelConfidence());
+                }
                 startActivity(intent);
                 finish();
             });

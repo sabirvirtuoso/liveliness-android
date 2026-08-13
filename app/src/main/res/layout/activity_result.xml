@@ -38,6 +38,22 @@
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintBottom_toTopOf="@id/btnBack" />
 
+    <TextView
+        android:id="@+id/tvConfidenceScore"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textSize="13sp"
+        android:textColor="@color/text_secondary"
+        android:textAlignment="center"
+        android:layout_marginTop="12dp"
+        android:layout_marginBottom="48dp"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/tvSubtitle"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/btnBack" />
+
     <com.google.android.material.button.MaterialButton
         android:id="@+id/btnBack"
         android:layout_width="0dp"

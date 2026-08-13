@@ -52,6 +52,20 @@ public abstract class ChallengeState {
         }
     }
 
+    /**
+     * All gesture challenges passed — the user is now asked to hold still
+     * for a moment while the MiniFASNet-V2 model snapshot is captured and
+     * classified (see LivenessViewModel's stillness-tracking logic and
+     * FaceAnalyzer.requestLivenessSnapshot()). Transitions to SessionPassed
+     * once a model result (success or failure) comes back.
+     */
+    public static final class StillnessCheck extends ChallengeState {
+        public static final StillnessCheck INSTANCE = new StillnessCheck();
+
+        private StillnessCheck() {
+        }
+    }
+
     public static final class SessionPassed extends ChallengeState {
         private final LivenessResult result;
 

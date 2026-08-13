@@ -1,5 +1,6 @@
 package com.example.faceliveness.detection;
 
+import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
@@ -25,6 +26,8 @@ import com.google.mlkit.vision.face.FaceDetectorOptions;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -64,6 +67,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     private final BiConsumer<Face, Boolean> onFaceDetected;
     private final BiConsumer<ChallengeType, Boolean> onChallengeValidated;
     private final Consumer<String> onSpoofDetected;
+    private final Consumer<MiniFasNetSpoofDetector.SpoofModelResult> onLivenessSnapshotResult;
 
     private final FaceDetector detector;
 
@@ -71,6 +75,17 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     public final FrameConsistencyChecker consistencyChecker = new FrameConsistencyChecker();
     public final PassiveAntiSpoofAnalyzer antiSpoofAnalyzer = new PassiveAntiSpoofAnalyzer();
     public final ScreenReplayDetector screenReplayDetector = new ScreenReplayDetector();
+
+    // Second, separate layer of security: a trained model run ONCE on a
+    // single snapshot after a deliberate "stay still" moment, rather than a
+    // continuous per-frame heuristic. See requestLivenessSnapshot().
+    private final MiniFasNetSpoofDetector spoofModel;
+
+    // ML Kit's success listener (where classify() would otherwise be called
+    // from) runs on the MAIN thread by default. Running ONNX inference there
+    // — even briefly — risks visible jank. This is only ever used for the
+    // rare one-shot snapshot classification, not per-frame work.
+    private final ExecutorService modelExecutor = Executors.newSingleThreadExecutor();
 
     // Current active challenge being evaluated
     private volatile LivenessChallenge activeChallenge;
@@ -80,6 +95,12 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     private int frameCount = 0;
     private boolean spoofAlreadyReported = false;
 
+    // Set by requestLivenessSnapshot() (called from LivenessActivity once
+    // LivenessViewModel's stillness timer is satisfied). Consumed on the
+    // next frame with a detected face — a one-shot trigger, not a per-frame
+    // continuous check like the other passive modules above.
+    private volatile boolean snapshotRequested = false;
+
     /**
      * @param onFaceDetected fires every frame with the detected face (or null)
      *                       and whether it's too far away for reliable passive
@@ -87,12 +108,16 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
      *                       verdict; UI code should reflect it rather than
      *                       recomputing its own approximation.
      */
-    public FaceAnalyzer(BiConsumer<Face, Boolean> onFaceDetected,
-                         BiConsumer<ChallengeType, Boolean> onChallengeValidated,
-                         Consumer<String> onSpoofDetected) {
+    public FaceAnalyzer(Context context,
+                        BiConsumer<Face, Boolean> onFaceDetected,
+                        BiConsumer<ChallengeType, Boolean> onChallengeValidated,
+                        Consumer<String> onSpoofDetected,
+                        Consumer<MiniFasNetSpoofDetector.SpoofModelResult> onLivenessSnapshotResult) {
         this.onFaceDetected = onFaceDetected;
         this.onChallengeValidated = onChallengeValidated;
         this.onSpoofDetected = onSpoofDetected;
+        this.onLivenessSnapshotResult = onLivenessSnapshotResult;
+        this.spoofModel = new MiniFasNetSpoofDetector(context);
 
         FaceDetectorOptions options = new FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
@@ -111,6 +136,17 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
 
     public void setActiveChallenge(LivenessChallenge activeChallenge) {
         this.activeChallenge = activeChallenge;
+    }
+
+    /**
+     * Requests that the NEXT frame with a detected face be captured and run
+     * through the MiniFASNet-V2 model — a one-shot trigger, called once
+     * LivenessViewModel's post-challenge stillness check is satisfied. The
+     * result (or failure) is delivered via the onLivenessSnapshotResult
+     * callback passed to the constructor.
+     */
+    public void requestLivenessSnapshot() {
+        snapshotRequested = true;
     }
 
     @OptIn(markerClass = ExperimentalGetImage.class) @Override
@@ -133,7 +169,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
         final YPlaneData yPlaneData = sampleThisFrame ? extractYPlane(imageProxy) : null;
 
         // Convert to bitmap for pixel analysis (only every N frames)
-        final Bitmap bitmap = (frameCount % PIXEL_ANALYSIS_INTERVAL == 0) ? imageProxyToBitmap(imageProxy) : null;
+        final Bitmap bitmap = (frameCount % PIXEL_ANALYSIS_INTERVAL == 0) ? imageProxyToBitmap(imageProxy, 60) : null;
 
         detector.process(image)
                 .addOnSuccessListener(faces -> {
@@ -166,6 +202,37 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                         // Check if passive checks have flagged a spoof
                         if (!spoofAlreadyReported) {
                             checkPassiveSpoofSignals();
+                        }
+
+                        // ── Liveness model snapshot (one-shot, see requestLivenessSnapshot()) ──
+                        if (snapshotRequested && !isTooFar) {
+                            // Also require in-range distance — same reasoning as the
+                            // ScreenReplayDetector gating above: a poorly-framed crop
+                            // would just feed the model a bad input. The request stays
+                            // pending (not consumed) until a qualifying frame arrives.
+                            snapshotRequested = false;
+                            final Rect faceBoundsSnapshot = face.getBoundingBox();
+                            // IMPORTANT: addOnCompleteListener (below) recycles `bitmap`
+                            // synchronously right after this listener returns — but
+                            // modelExecutor.submit() is fire-and-forget, so the async
+                            // task could still be reading it afterward. Copying here
+                            // (cheap relative to a one-shot event) gives the background
+                            // task its own independent Bitmap, unaffected by that recycle.
+                            final Bitmap snapshotBitmap = (bitmap != null)
+                                    ? bitmap.copy(bitmap.getConfig(), false)
+                                    : imageProxyToBitmap(imageProxy, 95);
+                            modelExecutor.submit(() -> {
+                                MiniFasNetSpoofDetector.SpoofModelResult result;
+                                if (snapshotBitmap == null) {
+                                    Log.w(TAG, "Liveness snapshot requested but bitmap conversion failed");
+                                    result = MiniFasNetSpoofDetector.SpoofModelResult.failure(
+                                            "Snapshot bitmap conversion failed");
+                                } else {
+                                    result = spoofModel.classify(snapshotBitmap, faceBoundsSnapshot);
+                                    snapshotBitmap.recycle();
+                                }
+                                onLivenessSnapshotResult.accept(result);
+                            });
                         }
 
                         // ── Challenge evaluation ────────────────────────────────────
@@ -377,7 +444,12 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
      * Converts a YUV_420_888 ImageProxy to a Bitmap for pixel analysis.
      * Returns null silently if conversion fails — pixel analysis is optional.
      */
-    @OptIn(markerClass = ExperimentalGetImage.class) private Bitmap imageProxyToBitmap(ImageProxy imageProxy) {
+    /** @param jpegQuality lower (e.g. 60) for routine per-frame heuristic sampling
+     *                    where throughput matters more than fidelity; higher
+     *                    (e.g. 95) for the one-shot MiniFASNet snapshot, which
+     *                    happens once per session and is worth the extra cost.
+     */
+    @OptIn(markerClass = ExperimentalGetImage.class) private Bitmap imageProxyToBitmap(ImageProxy imageProxy, int jpegQuality) {
         try {
             Image image = imageProxy.getImage();
             if (image == null) return null;
@@ -398,7 +470,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
             YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             // Use lower quality for performance — we're doing pixel stats, not display
-            yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 60, out);
+            yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), jpegQuality, out);
             byte[] imageBytes = out.toByteArray();
             return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
         } catch (Exception e) {
@@ -435,11 +507,14 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
         antiSpoofAnalyzer.reset();
         screenReplayDetector.reset();
         spoofAlreadyReported = false;
+        snapshotRequested = false;
         frameCount = 0;
     }
 
     public void shutdown() {
         detector.close();
+        spoofModel.close();
+        modelExecutor.shutdown();
     }
 
     private enum NodPhase {

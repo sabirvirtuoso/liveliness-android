@@ -49,11 +49,26 @@ public class LivenessViewModel extends ViewModel {
         return spoofWarning;
     }
 
+    // True once the post-challenge stillness check is satisfied — Activity
+    // observes this and calls faceAnalyzer.requestLivenessSnapshot(). See
+    // startStillnessCheck() below.
+    private final MutableLiveData<Boolean> snapshotRequested = new MutableLiveData<>(false);
+
+    public LiveData<Boolean> getSnapshotRequested() {
+        return snapshotRequested;
+    }
+
     private List<LivenessChallenge> challenges = new ArrayList<>();
     private int currentIndex = 0;
     private final List<ChallengeType> completedChallenges = new ArrayList<>();
     private CountDownTimer timer;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    // Post-challenge stillness check, before the model snapshot is captured.
+    private static final long STILLNESS_DURATION_MS = 3000L;
+    private static final long STILLNESS_TICK_MS = 200L;
+    private long stillnessAccumulatedMs = 0L;
+    private Runnable stillnessTickRunnable;
 
     /**
      * Starts a new liveness session with a fresh randomized challenge set.
@@ -63,6 +78,11 @@ public class LivenessViewModel extends ViewModel {
         currentIndex = 0;
         completedChallenges.clear();
         spoofWarning.setValue(null);
+        stillnessAccumulatedMs = 0L;
+        snapshotRequested.setValue(false);
+        if (stillnessTickRunnable != null) {
+            mainHandler.removeCallbacks(stillnessTickRunnable);
+        }
         startNextChallenge();
     }
 
@@ -111,13 +131,76 @@ public class LivenessViewModel extends ViewModel {
                 if (currentIndex < challenges.size()) {
                     startNextChallenge();
                 } else {
+                    startStillnessCheck();
                     // All challenges completed
-                    challengeState.setValue(new ChallengeState.SessionPassed(
-                            new LivenessResult(true, new ArrayList<>(completedChallenges))
-                    ));
+//                    challengeState.setValue(new ChallengeState.SessionPassed(
+//                            new LivenessResult(true, new ArrayList<>(completedChallenges))
+//                    ));
                 }
             }, 800);
         }
+    }
+
+    /**
+     * Begins the post-challenge stillness phase: the user is asked to hold
+     * still while a face stays continuously detected for STILLNESS_DURATION_MS.
+     * Uses the same "pause, don't reset" pattern established elsewhere in this
+     * app (see FaceAnalyzer's isTooFar/spoof gating) — a momentary detection
+     * drop doesn't restart the count from zero, it just stops accumulating
+     * until the face reappears. Once satisfied, snapshotRequested flips to
+     * true; LivenessActivity observes that and calls
+     * faceAnalyzer.requestLivenessSnapshot().
+     */
+    private void startStillnessCheck() {
+        challengeState.setValue(ChallengeState.StillnessCheck.INSTANCE);
+        stillnessAccumulatedMs = 0L;
+        snapshotRequested.setValue(false);
+        scheduleStillnessTick();
+    }
+
+    private void scheduleStillnessTick() {
+        stillnessTickRunnable = () -> {
+            if (Boolean.TRUE.equals(faceVisible.getValue())) {
+                stillnessAccumulatedMs += STILLNESS_TICK_MS;
+            }
+
+            if (stillnessAccumulatedMs >= STILLNESS_DURATION_MS) {
+                snapshotRequested.setValue(true);
+                // Stop ticking — now waiting for onLivenessModelResult().
+            } else {
+                mainHandler.postDelayed(stillnessTickRunnable, STILLNESS_TICK_MS);
+            }
+        };
+        mainHandler.postDelayed(stillnessTickRunnable, STILLNESS_TICK_MS);
+    }
+
+    /**
+     * Called by LivenessActivity once FaceAnalyzer's one-shot model
+     * classification completes (success or failure — see
+     * MiniFasNetSpoofDetector.SpoofModelResult).
+     *
+     * DESIGN CHOICE: a model failure (missing/corrupt model file, inference
+     * error, unsupported ABI, etc.) does NOT fail an otherwise-passed session
+     * — the heuristic checks (FrameConsistencyChecker, PassiveAntiSpoofAnalyzer,
+     * ScreenReplayDetector, ExpressionDynamicsAnalyzer) already gated this
+     * session before it got here, so treating a model-layer outage as a hard
+     * failure would make the whole flow newly fragile to something as simple
+     * as forgetting to bundle the .onnx asset. The failure is logged (see
+     * MiniFasNetSpoofDetector) and surfaced to the result screen as an absent
+     * score rather than blocking the user. If you'd rather this be a hard
+     * gate instead, this is the one place to change that.
+     */
+    public void onLivenessModelResult(boolean success, float livenessScore, String errorMessage) {
+        ChallengeState state = challengeState.getValue();
+        if (!(state instanceof ChallengeState.StillnessCheck)) {
+            // Stale/duplicate callback (e.g. a race with a retry) — ignore.
+            return;
+        }
+
+        Float confidence = success ? livenessScore : null;
+        challengeState.setValue(new ChallengeState.SessionPassed(
+                new LivenessResult(true, new ArrayList<>(completedChallenges), null, null, null, confidence)
+        ));
     }
 
     /**

@@ -36,9 +36,9 @@ android {
 dependencies {
     // AndroidX Core
     implementation 'androidx.core:core:1.19.0'
-    implementation 'androidx.appcompat:appcompat:1.7.1'
+    implementation 'androidx.appcompat:appcompat:1.8.0'
     implementation 'com.google.android.material:material:1.14.0'
-    implementation 'androidx.constraintlayout:constraintlayout:2.2.1'
+    implementation 'androidx.constraintlayout:constraintlayout:2.2.2'
     implementation 'androidx.lifecycle:lifecycle-runtime:2.11.0'
     implementation 'androidx.lifecycle:lifecycle-viewmodel:2.11.0'
     implementation 'androidx.lifecycle:lifecycle-livedata:2.11.0'
@@ -52,6 +52,10 @@ dependencies {
     implementation 'androidx.camera:camera-camera2:1.6.1'
     implementation 'androidx.camera:camera-lifecycle:1.6.1'
     implementation 'androidx.camera:camera-view:1.6.1'
+
+    // ONNX Runtime — used by MiniFasNetSpoofDetector for the on-device
+    // anti-spoofing model (see /app/src/main/assets/minifasnet_v2.onnx)
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.29.0'
 
     // Testing
     testImplementation 'junit:junit:4.13.2'
