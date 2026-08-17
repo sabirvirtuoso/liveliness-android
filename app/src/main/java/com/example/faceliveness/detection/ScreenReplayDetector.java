@@ -92,7 +92,7 @@ public class ScreenReplayDetector {
     // PLACEHOLDER — calibrate from real Log.d output. Normalized autocorrelation
     // (0..1) above this = a repeating pattern was found, consistent with
     // pixel-grid interference rather than ordinary texture/noise.
-    private static final float PERIODICITY_THRESHOLD = 0.35f;
+    private static final float PERIODICITY_THRESHOLD = 0.40f;
 
     // How many recent frames' mean brightness we track for flicker analysis.
     private static final int FLICKER_WINDOW = 12;

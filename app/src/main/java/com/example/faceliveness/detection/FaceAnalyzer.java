@@ -212,6 +212,10 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                             // pending (not consumed) until a qualifying frame arrives.
                             snapshotRequested = false;
                             final Rect faceBoundsSnapshot = face.getBoundingBox();
+                            // Captured now, synchronously — imageProxy may already be
+                            // closed by the time modelExecutor's async task runs, and
+                            // touching a closed ImageProxy's ImageInfo isn't safe.
+                            final int rotationDegrees = imageProxy.getImageInfo().getRotationDegrees();
                             // IMPORTANT: addOnCompleteListener (below) recycles `bitmap`
                             // synchronously right after this listener returns — but
                             // modelExecutor.submit() is fire-and-forget, so the async
@@ -228,7 +232,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                                     result = MiniFasNetSpoofDetector.SpoofModelResult.failure(
                                             "Snapshot bitmap conversion failed");
                                 } else {
-                                    result = spoofModel.classify(snapshotBitmap, faceBoundsSnapshot);
+                                    result = spoofModel.classify(snapshotBitmap, faceBoundsSnapshot, rotationDegrees);
                                     snapshotBitmap.recycle();
                                 }
                                 onLivenessSnapshotResult.accept(result);
