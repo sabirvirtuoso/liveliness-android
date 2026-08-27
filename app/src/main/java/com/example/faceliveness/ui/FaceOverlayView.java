@@ -7,6 +7,7 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.util.AttributeSet;
+import android.util.Log;
 import android.view.View;
 
 import androidx.annotation.NonNull;
@@ -20,9 +21,32 @@ import com.google.mlkit.vision.face.Face;
  */
 public class FaceOverlayView extends View {
 
+    private static final String TAG = "FaceOverlayView";
+    // Ratio of the 9 sampled face-box points (see isFaceWithinOval) required
+    // to fall inside the guide oval. Requested as "3/9 or 4/9" — 4/9 chosen
+    // as the default (slightly stricter); change to 3f/9f if 4/9 proves too
+    // strict in practice. PLACEHOLDER — calibrate against real sessions.
+    private static final float OVAL_OVERLAP_THRESHOLD = 3f / 9f;
+
+    // This app always uses the front camera (see LivenessActivity.startCamera(),
+    // CameraSelector.DEFAULT_FRONT_CAMERA). CameraX's Preview use case
+    // auto-mirrors the ON-SCREEN display for a front camera (so the user sees
+    // a normal "mirror" selfie view), but the raw ImageAnalysis buffer ML Kit
+    // reads — and therefore face.getBoundingBox() — is NOT mirrored. Drawing
+    // an unmirrored box over a mirrored preview puts it on the wrong side;
+    // this corrects for that explicitly.
+    private static final boolean MIRROR_FOR_FRONT_CAMERA = true;
+
     private Face face;
     private int previewWidth = 0;
     private int previewHeight = 0;
+
+    // Named frameWidth/frameHeight (not previewWidth/previewHeight) deliberately —
+    // these are the RAW SENSOR frame's dimensions, not any UI view's own pixel
+    // size. See FaceAnalyzer.getLastFrameWidth()/getLastFrameHeight() doc.
+    private int frameWidth = 0;
+    private int frameHeight = 0;
+    private int rotationDegrees = 0;
 
     private boolean isFaceDetected = false;
     private boolean isChallengePassed = false;
@@ -99,10 +123,19 @@ public class FaceOverlayView extends View {
         postInvalidate();
     }
 
-    public void updateFace(@Nullable Face detectedFace, int width, int height) {
+    /**
+     * @param width           RAW SENSOR frame width (e.g. FaceAnalyzer.getLastFrameWidth()) —
+     *                        NOT any UI view's pixel width.
+     * @param height          RAW SENSOR frame height — same caveat.
+     * @param rotationDegrees imageProxy.getImageInfo().getRotationDegrees() —
+     *                        needed to correctly rotate face bounds into
+     *                        view-space; see mapFrameRectToView().
+     */
+    public void updateFace(@Nullable Face detectedFace, int width, int height, int rotationDegrees) {
         face = detectedFace;
-        previewWidth = width;
-        previewHeight = height;
+        frameWidth = width;
+        frameHeight = height;
+        this.rotationDegrees = rotationDegrees;
         isFaceDetected = detectedFace != null;
         postInvalidate();
     }
@@ -157,15 +190,9 @@ public class FaceOverlayView extends View {
         boolean showWarningStyle = spoofWarningMessage != null || isFaceTooFar;
 
         // Draw face bounding box if face is detected
-        if (face != null && previewWidth > 0 && previewHeight > 0) {
-            float scaleX = getWidth() / (float) previewHeight; // rotated
-            float scaleY = getHeight() / (float) previewWidth;
-
-            Rect bounds = face.getBoundingBox();
-            scaledRect.set(bounds.left * scaleX,
-                    bounds.top * scaleY,
-                    bounds.right * scaleX,
-                    bounds.bottom * scaleY);
+        if (face != null && frameWidth > 0 && frameHeight > 0) {
+            RectF faceRectView = mapFrameRectToView(face.getBoundingBox(), frameWidth, frameHeight, rotationDegrees);
+            scaledRect.set(faceRectView);
 
             canvas.drawRect(scaledRect, showWarningStyle ? warningBoxPaint : boxPaint);
 
@@ -178,5 +205,138 @@ public class FaceOverlayView extends View {
                 canvas.drawText("Move closer", getWidth() / 2f, ovalRect.top - 24f, warningTextPaint);
             }
         }
+    }
+
+    /**
+     * True when at least OVAL_OVERLAP_THRESHOLD (3/9 or 4/9, see that
+     * constant) of the face's bounding box lies within the guide oval.
+     * Approximated by sampling 9 points of the mapped face box (4 corners,
+     * 4 edge midpoints, center) against a point-in-ellipse test, rather than
+     * computing exact ellipse-rectangle overlap area — that has no simple
+     * closed form, and this is a UX guide check, not a security boundary, so
+     * a lightweight approximation is a reasonable tradeoff. Uses
+     * mapFrameRectToView() — the SAME transform onDraw() uses — so this
+     * stays consistent with what's actually drawn on screen.
+     *
+     * @param frameWidth      RAW SENSOR frame width — NOT any UI view's pixel width.
+     * @param frameHeight     RAW SENSOR frame height — same caveat.
+     * @param rotationDegrees imageProxy.getImageInfo().getRotationDegrees().
+     */
+    public boolean isFaceWithinOval(Face face, int frameWidth, int frameHeight, int rotationDegrees) {
+        if (face == null || frameWidth <= 0 || frameHeight <= 0 || getWidth() <= 0 || getHeight() <= 0) {
+            return false;
+        }
+
+        RectF r = mapFrameRectToView(face.getBoundingBox(), frameWidth, frameHeight, rotationDegrees);
+        float midX = r.centerX();
+        float midY = r.centerY();
+
+        float[][] samplePoints = {
+                {r.left, r.top}, {r.right, r.top}, {r.left, r.bottom}, {r.right, r.bottom},
+                {midX, r.top}, {midX, r.bottom}, {r.left, midY}, {r.right, midY},
+                {midX, midY}
+        };
+
+        int insideCount = 0;
+        for (float[] p : samplePoints) {
+            if (isPointInOval(p[0], p[1])) insideCount++;
+        }
+        boolean result = (float) insideCount / samplePoints.length >= OVAL_OVERLAP_THRESHOLD;
+
+        Log.d(TAG, String.format(java.util.Locale.US,
+                "isFaceWithinOval — faceRectView=[%.0f,%.0f,%.0f,%.0f] ovalRect=[%.0f,%.0f,%.0f,%.0f] " +
+                        "insideCount=%d/9 threshold=%.2f result=%b",
+                r.left, r.top, r.right, r.bottom, ovalRect.left, ovalRect.top, ovalRect.right, ovalRect.bottom,
+                insideCount, OVAL_OVERLAP_THRESHOLD, result));
+
+        return result;
+    }
+
+    /**
+     * Maps a rect in RAW SENSOR coordinate space into view-pixel space,
+     * accounting for:
+     *  1. Sensor rotation (rotationDegrees) — a genuine geometric rotation of
+     *     each corner (0/90/180/270), not an axis-swapped-scale approximation.
+     *  2. Front-camera horizontal mirroring (MIRROR_FOR_FRONT_CAMERA).
+     *  3. Uniform scaling from the now-correctly-oriented rotated space into
+     *     actual view pixel dimensions.
+     * All 4 corners are transformed individually and then bounded (min/max),
+     * rather than transforming just two opposite corners — an axis-aligned
+     * rect rotated by a multiple of 90° is still axis-aligned in the rotated
+     * space either way, and this avoids sign mistakes in any one case.
+     */
+    private RectF mapFrameRectToView(Rect raw, int frameWidth, int frameHeight, int rotationDegrees) {
+        float[][] corners = {
+                {raw.left, raw.top}, {raw.right, raw.top}, {raw.left, raw.bottom}, {raw.right, raw.bottom}
+        };
+
+        int rotatedW, rotatedH;
+        float[][] rotated = new float[4][2];
+        int normalizedDegrees = ((rotationDegrees % 360) + 360) % 360;
+
+        switch (normalizedDegrees) {
+            case 90:
+                rotatedW = frameHeight;
+                rotatedH = frameWidth;
+                for (int i = 0; i < 4; i++) {
+                    rotated[i][0] = frameHeight - corners[i][1];
+                    rotated[i][1] = corners[i][0];
+                }
+                break;
+            case 180:
+                rotatedW = frameWidth;
+                rotatedH = frameHeight;
+                for (int i = 0; i < 4; i++) {
+                    rotated[i][0] = frameWidth - corners[i][0];
+                    rotated[i][1] = frameHeight - corners[i][1];
+                }
+                break;
+            case 270:
+                rotatedW = frameHeight;
+                rotatedH = frameWidth;
+                for (int i = 0; i < 4; i++) {
+                    rotated[i][0] = corners[i][1];
+                    rotated[i][1] = frameWidth - corners[i][0];
+                }
+                break;
+            default: // 0
+                rotatedW = frameWidth;
+                rotatedH = frameHeight;
+                for (int i = 0; i < 4; i++) {
+                    rotated[i][0] = corners[i][0];
+                    rotated[i][1] = corners[i][1];
+                }
+        }
+
+        if (MIRROR_FOR_FRONT_CAMERA) {
+            for (int i = 0; i < 4; i++) {
+                rotated[i][0] = rotatedW - rotated[i][0];
+            }
+        }
+
+        float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE;
+        float maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+        for (float[] p : rotated) {
+            minX = Math.min(minX, p[0]);
+            maxX = Math.max(maxX, p[0]);
+            minY = Math.min(minY, p[1]);
+            maxY = Math.max(maxY, p[1]);
+        }
+
+        float scaleX = getWidth() / (float) rotatedW;
+        float scaleY = getHeight() / (float) rotatedH;
+
+        return new RectF(minX * scaleX, minY * scaleY, maxX * scaleX, maxY * scaleY);
+    }
+
+    private boolean isPointInOval(float x, float y) {
+        float cx = ovalRect.centerX();
+        float cy = ovalRect.centerY();
+        float rx = ovalRect.width() / 2f;
+        float ry = ovalRect.height() / 2f;
+        if (rx <= 0 || ry <= 0) return false;
+        float dx = (x - cx) / rx;
+        float dy = (y - cy) / ry;
+        return (dx * dx + dy * dy) <= 1f;
     }
 }

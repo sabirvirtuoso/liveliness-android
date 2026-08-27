@@ -73,14 +73,35 @@ public class LivenessActivity extends AppCompatActivity {
                     // Activity's own destruction state explicitly before touching either.
                     if (isDestroyed() || isFinishing()) return;
 
-                    PreviewView previewView = binding.previewView;
-                    binding.faceOverlay.updateFace(face, previewView.getWidth(), previewView.getHeight());
+                    //PreviewView previewView = binding.previewView;
+                    // IMPORTANT: source frame dimensions/rotation from FaceAnalyzer's
+                    // getters — the RAW SENSOR frame's own dimensions, the same
+                    // coordinate space face.getBoundingBox() is defined in — NOT
+                    // binding.previewView.getWidth()/getHeight(), which is an
+                    // unrelated number (the on-screen view's own pixel size) that
+                    // silently breaks the face-bounds-to-screen coordinate mapping
+                    // if substituted here.
+                    int frameWidth = faceAnalyzer.getLastFrameWidth();
+                    int frameHeight = faceAnalyzer.getLastFrameHeight();
+                    int rotationDegrees = faceAnalyzer.getLastRotationDegrees();
+
+                    binding.faceOverlay.updateFace(face, frameWidth, frameHeight, rotationDegrees);
                     // isTooFar comes from FaceAnalyzer's own raw-sensor-space computation —
                     // the single source of truth that also gates challenge/spoof processing —
                     // rather than FaceOverlayView recomputing its own screen-space approximation.
                     binding.faceOverlay.setTooFar(isTooFar);
                     binding.faceOverlay.setStatus(face != null);
-                    viewModel.onFaceVisibilityChanged(face != null);
+
+                    boolean withinOval = face != null
+                            && binding.faceOverlay.isFaceWithinOval(face, frameWidth, frameHeight, rotationDegrees);
+                    // "Properly positioned" = present, at a good distance, AND
+                    // mostly within the guide oval — this combined signal is what
+                    // drives the stillness timer's reset-vs-accumulate decision
+                    // (see LivenessViewModel.scheduleStillnessTick()) as well as
+                    // the general face-status text.
+                    boolean isProperlyPositioned = face != null && !isTooFar && withinOval;
+                    viewModel.onFaceVisibilityChanged(isProperlyPositioned);
+                    //viewModel.onFaceVisibilityChanged(face != null);
                     faceAnalyzer.setActiveChallenge(viewModel.currentChallenge());
                 }),
                 (type, success) -> {
@@ -201,6 +222,15 @@ public class LivenessActivity extends AppCompatActivity {
         binding.tvFaceStatus.setTextColor(
                 ContextCompat.getColor(this, visible ? android.R.color.holo_green_light : android.R.color.holo_red_light)
         );
+
+        // During the post-challenge stillness phase specifically, also swap
+        // the instruction text so the user knows why the hold-still timer
+        // reset — see LivenessViewModel.scheduleStillnessTick(), which reads
+        // this same signal to RESET (not pause) stillnessAccumulatedMs.
+        ChallengeState currentState = viewModel.getChallengeState().getValue();
+        if (currentState instanceof ChallengeState.StillnessCheck) {
+            binding.tvInstruction.setText(visible ? "Hold still..." : "Reposition your face");
+        }
     }
 
     private void onSpoofWarningChanged(String warning) {

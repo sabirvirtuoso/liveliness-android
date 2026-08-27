@@ -1,0 +1,118 @@
+# ==============================
+# Android Studio / IntelliJ
+# ==============================
+
+# Android Studio project settings
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Local Android SDK path
+local.properties
+
+
+# ==============================
+# Gradle
+# ==============================
+
+.gradle/
+build/
+**/build/
+
+# Gradle generated files
+gradle-app.setting
+!gradle-wrapper.jar
+
+
+# ==============================
+# Android build outputs
+# ==============================
+
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Native build outputs
+.externalNativeBuild/
+.cxx/
+
+
+# ==============================
+# Kotlin
+# ==============================
+
+*.class
+.kotlin/
+
+
+# ==============================
+# Generated files
+# ==============================
+
+captures/
+.externalNativeBuild/
+.navigation/
+
+# Generated Android resources
+gen/
+out/
+
+
+# ==============================
+# Signing / credentials
+# ==============================
+
+*.jks
+*.keystore
+
+# If you have signing configuration containing passwords
+keystore.properties
+
+
+# ==============================
+# Logs
+# ==============================
+
+*.log
+
+
+# ==============================
+# OS generated files
+# ==============================
+
+.DS_Store
+Thumbs.db
+
+
+# ==============================
+# Temporary files
+# ==============================
+
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# IntelliJ temporary files
+*.iws
+
+
+# ==============================
+# Firebase / Google services
+# ==============================
+
+# Uncomment these ONLY if you intentionally
+# don't want these files in Git:
+#
+# google-services.json
+
+
+# ==============================
+# Environment / local configuration
+# ==============================
+
+.env
+.env.*
+!.env.example

@@ -91,20 +91,45 @@ public class LivenessViewModel extends ViewModel {
     }
 
     /**
-     * Called by FaceAnalyzer when passive anti-spoof checks detect a spoof attempt.
-     * Immediately fails the session — no challenge result can override this.
+     * Called by FaceAnalyzer when passive anti-spoof checks detect a spoof
+     * attempt.
+     *
+     * During the StillnessCheck phase specifically, this IMMEDIATELY fails
+     * the session — same SessionFailed/LivenessResult shape as a challenge
+     * timeout (see startChallengeTimer()'s onFinish()), so it flows through
+     * the exact same "show result, offer Retry" path with no other changes
+     * needed. The stillness snapshot is the last, most security-sensitive
+     * step before a pass, so a spoof signal here shouldn't wait for
+     * anything else to resolve it.
+     *
+     * During any other phase (an active challenge), this only surfaces a
+     * live warning (see FaceOverlayView.setSpoofWarning()) — the session is
+     * NOT failed immediately there; challenge evaluation is independently
+     * paused elsewhere (FaceAnalyzer's spoofAlreadyReported gating) while
+     * the flag remains set, and an unmet challenge times out normally if it
+     * can't clear before its own timer runs out.
      */
     public void onSpoofDetected(String reason) {
-        //cancelTimer();
         spoofWarning.setValue(reason);
-//        challengeState.setValue(new ChallengeState.SessionFailed(
-//                new LivenessResult(false, new ArrayList<>(completedChallenges), null,
-//                        "Spoof attempt detected: " + reason, null)
-//        ));
+
+        ChallengeState currentState = challengeState.getValue();
+        if (currentState instanceof ChallengeState.StillnessCheck) {
+            cancelTimer(); // also stops the stillness tick loop — shares mainHandler
+            challengeState.setValue(new ChallengeState.SessionFailed(
+                    new LivenessResult(false, new ArrayList<>(completedChallenges), null,
+                            "Spoof attempt detected: " + reason, null)
+            ));
+        }
     }
 
     /**
-     * Called by FaceAnalyzer when it detects face presence changes.
+     * Called by FaceAnalyzer/LivenessActivity when face presence changes.
+     * During the StillnessCheck phase specifically, LivenessActivity passes
+     * a combined signal here — present, correctly distanced, AND mostly
+     * within the guide oval (see FaceOverlayView.isFaceWithinOval()) — not
+     * just raw ML Kit presence, since that combined signal is what
+     * scheduleStillnessTick() reads to decide whether to accumulate or
+     * reset the stillness timer.
      */
     public void onFaceVisibilityChanged(boolean visible) {
         faceVisible.setValue(visible);
@@ -162,6 +187,11 @@ public class LivenessViewModel extends ViewModel {
         stillnessTickRunnable = () -> {
             if (Boolean.TRUE.equals(faceVisible.getValue())) {
                 stillnessAccumulatedMs += STILLNESS_TICK_MS;
+            } else {
+                // RESET, not pause — see startStillnessCheck()'s doc for why
+                // this phase intentionally differs from the pause pattern
+                // used for isTooFar/spoof gating during active challenges.
+                stillnessAccumulatedMs = 0L;
             }
 
             if (stillnessAccumulatedMs >= STILLNESS_DURATION_MS) {

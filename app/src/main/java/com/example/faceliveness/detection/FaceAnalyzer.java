@@ -101,6 +101,33 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     // continuous check like the other passive modules above.
     private volatile boolean snapshotRequested = false;
 
+    // Raw sensor frame dimensions and rotation for the CURRENT frame being
+    // processed — set right before onFaceDetected.accept() is invoked below,
+    // so callers can read them synchronously inside that same callback.
+    // IMPORTANT: these are the RAW CAMERA SENSOR frame's dimensions
+    // (imageProxy.getWidth()/getHeight()), the SAME coordinate space
+    // face.getBoundingBox() is defined in — deliberately NOT any UI view's
+    // pixel size (e.g. PreviewView.getWidth()/getHeight()), which is an
+    // unrelated number that happens to sound similar. Substituting a view's
+    // own screen dimensions here silently breaks the face-bounds-to-screen
+    // coordinate mapping despite looking superficially plausible for a
+    // simple drawn box — always read these getters, not previewView.
+    private volatile int lastFrameWidth = 0;
+    private volatile int lastFrameHeight = 0;
+    private volatile int lastRotationDegrees = 0;
+
+    public int getLastFrameWidth() {
+        return lastFrameWidth;
+    }
+
+    public int getLastFrameHeight() {
+        return lastFrameHeight;
+    }
+
+    public int getLastRotationDegrees() {
+        return lastRotationDegrees;
+    }
+
     /**
      * @param onFaceDetected fires every frame with the detected face (or null)
      *                       and whether it's too far away for reliable passive
@@ -175,6 +202,11 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                 .addOnSuccessListener(faces -> {
                     Face face = faces.isEmpty() ? null : faces.get(0);
                     boolean isTooFar = face != null && isFaceTooFar(face, imageProxy);
+                    // Set BEFORE accept() — onFaceDetected's callback runs synchronously
+                    // right below, so these are guaranteed current for that call.
+                    lastFrameWidth = imageProxy.getWidth();
+                    lastFrameHeight = imageProxy.getHeight();
+                    lastRotationDegrees = imageProxy.getImageInfo().getRotationDegrees();
                     onFaceDetected.accept(face, isTooFar);
 
                     if (face != null) {
