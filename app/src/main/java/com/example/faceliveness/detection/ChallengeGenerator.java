@@ -27,11 +27,11 @@ public final class ChallengeGenerator {
     private static final List<LivenessChallenge> ALL_CHALLENGES = new ArrayList<>();
 
     static {
-        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.BLINK, "Please blink your eyes. Open your spectacles", 8000L));
-        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.TURN_LEFT, "Turn your head to the LEFT", 8000L));
-        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.TURN_RIGHT, "Turn your head to the RIGHT", 8000L));
-        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.SMILE, "Please smile", 8000L));
-        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.NOD, "Nod your head up and down", 8000L));
+        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.BLINK, "Please blink your eyes. Open your spectacles", 10000L));
+        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.TURN_LEFT, "Turn your head to the LEFT", 10000L));
+        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.TURN_RIGHT, "Turn your head to the RIGHT", 10000L));
+        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.SMILE, "Please smile", 10000L));
+        ALL_CHALLENGES.add(new LivenessChallenge(ChallengeType.NOD, "Nod your head up and down", 10000L));
     }
 
     // Random jitter applied to each challenge's timeout at generation time —

@@ -15,3 +15,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "FaceLiveness"
 include ':app'
+include ':libfacesdk'
+include ':libfotoapparat'

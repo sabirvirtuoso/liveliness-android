@@ -1,8 +1,13 @@
 package com.example.faceliveness.detection;
 
+import android.graphics.Bitmap;
 import android.util.Log;
 
+import com.kbyai.facesdk.FaceBox;
+import com.kbyai.facesdk.FaceSDK;
+
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -92,7 +97,8 @@ public class ScreenReplayDetector {
     // PLACEHOLDER — calibrate from real Log.d output. Normalized autocorrelation
     // (0..1) above this = a repeating pattern was found, consistent with
     // pixel-grid interference rather than ordinary texture/noise.
-    private static final float PERIODICITY_THRESHOLD = 0.40f;
+    private static final float PERIODICITY_THRESHOLD = 0.50f;
+    private static final float LIVENESS_THRESHOLD = 0.7f;
 
     // How many recent frames' mean brightness we track for flicker analysis.
     private static final int FLICKER_WINDOW = 12;
@@ -216,6 +222,25 @@ public class ScreenReplayDetector {
                     suspiciousCount + "/" + FRAMES_FOR_VERDICT + " frames showed screen-replay artifacts");
         } else {
             return new SpoofSignal(false, confidence, "No consistent screen-replay artifacts");
+        }
+    }
+
+    public SpoofSignal classify(byte[] nv21, int width, int height) {
+        Bitmap bitmap  = FaceSDK.yuv2Bitmap(nv21, width, height, 7);
+        List<FaceBox> faceBoxes = FaceSDK.faceDetection(bitmap);
+
+        float livenessSum = 0;
+        int faceBoxesSize = faceBoxes.size();
+
+        for (int i = 0; i < faceBoxesSize; i++) {
+            livenessSum += faceBoxes.get(i).liveness;
+        }
+
+        float averageLivenessConfidence = livenessSum/faceBoxesSize;
+        if (averageLivenessConfidence < LIVENESS_THRESHOLD) {
+            return new SpoofSignal(true, averageLivenessConfidence, " frames showed spoof attempts");
+        } else {
+            return new SpoofSignal(false, averageLivenessConfidence, "frames showed live user");
         }
     }
 

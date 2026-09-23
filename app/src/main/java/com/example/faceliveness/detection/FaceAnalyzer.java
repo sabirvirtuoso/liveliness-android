@@ -62,12 +62,12 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     // user moves closer. This is computed independently of — but should be
     // kept roughly in sync with — FaceOverlayView.MIN_FACE_WIDTH_RATIO, which
     // only drives the UI hint and has no enforcement power on its own.
-    private static final float MIN_FACE_WIDTH_RATIO = 0.40f;
+    private static final float MIN_FACE_WIDTH_RATIO = 0.35f;
 
     private final BiConsumer<Face, Boolean> onFaceDetected;
     private final BiConsumer<ChallengeType, Boolean> onChallengeValidated;
     private final Consumer<String> onSpoofDetected;
-    private final Consumer<MiniFasNetSpoofDetector.SpoofModelResult> onLivenessSnapshotResult;
+    private final Consumer<ScreenReplayDetector.SpoofSignal> onLivenessSnapshotResult;
 
     private final FaceDetector detector;
 
@@ -139,7 +139,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                         BiConsumer<Face, Boolean> onFaceDetected,
                         BiConsumer<ChallengeType, Boolean> onChallengeValidated,
                         Consumer<String> onSpoofDetected,
-                        Consumer<MiniFasNetSpoofDetector.SpoofModelResult> onLivenessSnapshotResult) {
+                        Consumer<ScreenReplayDetector.SpoofSignal> onLivenessSnapshotResult) {
         this.onFaceDetected = onFaceDetected;
         this.onChallengeValidated = onChallengeValidated;
         this.onSpoofDetected = onSpoofDetected;
@@ -184,7 +184,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
         }
 
         frameCount++;
-        InputImage image = InputImage.fromMediaImage(imageProxy.getImage(), imageProxy.getImageInfo().getRotationDegrees());
+        InputImage imageForMLKit = InputImage.fromMediaImage(imageProxy.getImage(), imageProxy.getImageInfo().getRotationDegrees());
 
         // Raw Y-plane (luma) bytes, read BEFORE the JPEG conversion below —
         // imageProxyToBitmap() consumes the original Y buffer's position via
@@ -198,7 +198,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
         // Convert to bitmap for pixel analysis (only every N frames)
         final Bitmap bitmap = (frameCount % PIXEL_ANALYSIS_INTERVAL == 0) ? imageProxyToBitmap(imageProxy, 60) : null;
 
-        detector.process(image)
+        detector.process(imageForMLKit)
                 .addOnSuccessListener(faces -> {
                     Face face = faces.isEmpty() ? null : faces.get(0);
                     boolean isTooFar = face != null && isFaceTooFar(face, imageProxy);
@@ -243,32 +243,27 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                             // would just feed the model a bad input. The request stays
                             // pending (not consumed) until a qualifying frame arrives.
                             snapshotRequested = false;
-                            final Rect faceBoundsSnapshot = face.getBoundingBox();
-                            // Captured now, synchronously — imageProxy may already be
-                            // closed by the time modelExecutor's async task runs, and
-                            // touching a closed ImageProxy's ImageInfo isn't safe.
-                            final int rotationDegrees = imageProxy.getImageInfo().getRotationDegrees();
-                            // IMPORTANT: addOnCompleteListener (below) recycles `bitmap`
-                            // synchronously right after this listener returns — but
-                            // modelExecutor.submit() is fire-and-forget, so the async
-                            // task could still be reading it afterward. Copying here
-                            // (cheap relative to a one-shot event) gives the background
-                            // task its own independent Bitmap, unaffected by that recycle.
-                            final Bitmap snapshotBitmap = (bitmap != null)
-                                    ? bitmap.copy(bitmap.getConfig(), false)
-                                    : imageProxyToBitmap(imageProxy, 95);
-                            modelExecutor.submit(() -> {
-                                MiniFasNetSpoofDetector.SpoofModelResult result;
-                                if (snapshotBitmap == null) {
-                                    Log.w(TAG, "Liveness snapshot requested but bitmap conversion failed");
-                                    result = MiniFasNetSpoofDetector.SpoofModelResult.failure(
-                                            "Snapshot bitmap conversion failed");
-                                } else {
-                                    result = spoofModel.classify(snapshotBitmap, faceBoundsSnapshot, rotationDegrees);
-                                    snapshotBitmap.recycle();
-                                }
-                                onLivenessSnapshotResult.accept(result);
-                            });
+
+                            Image image = imageProxy.getImage();
+
+                            Image.Plane[] planes = image.getPlanes();
+                            ByteBuffer yBuffer = planes[0].getBuffer();
+                            ByteBuffer uBuffer = planes[1].getBuffer();
+                            ByteBuffer vBuffer = planes[2].getBuffer();
+
+                            int ySize = yBuffer.remaining();
+                            int uSize = uBuffer.remaining();
+                            int vSize = vBuffer.remaining();
+
+                            byte[] nv21 = new byte[ySize + uSize + vSize];
+                            yBuffer.get(nv21, 0, ySize);
+                            vBuffer.get(nv21, ySize, vSize);
+                            uBuffer.get(nv21, ySize + vSize, uSize);
+
+                            ScreenReplayDetector.SpoofSignal result;
+                            result = screenReplayDetector.classify(nv21, image.getWidth(), image.getHeight());
+
+                            onLivenessSnapshotResult.accept(result);
                         }
 
                         // ── Challenge evaluation ────────────────────────────────────

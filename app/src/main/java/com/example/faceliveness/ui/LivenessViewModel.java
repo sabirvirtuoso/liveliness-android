@@ -3,6 +3,7 @@ package com.example.faceliveness.ui;
 import android.os.CountDownTimer;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.lifecycle.LiveData;
@@ -20,6 +21,7 @@ import java.util.List;
 
 public class LivenessViewModel extends ViewModel {
 
+    private static final String TAG = "LivenessViewModel";
     // Emits current challenge state to the UI
     private final MutableLiveData<ChallengeState> challengeState =
             new MutableLiveData<>(ChallengeState.Idle.INSTANCE);
@@ -220,17 +222,22 @@ public class LivenessViewModel extends ViewModel {
      * score rather than blocking the user. If you'd rather this be a hard
      * gate instead, this is the one place to change that.
      */
-    public void onLivenessModelResult(boolean success, float livenessScore, String errorMessage) {
+    public void onLivenessModelResult(boolean isSuspected, float livenessScore, String errorMessage) {
         ChallengeState state = challengeState.getValue();
         if (!(state instanceof ChallengeState.StillnessCheck)) {
             // Stale/duplicate callback (e.g. a race with a retry) — ignore.
             return;
         }
 
-        Float confidence = success ? livenessScore : null;
-        challengeState.setValue(new ChallengeState.SessionPassed(
-                new LivenessResult(true, new ArrayList<>(completedChallenges), null, null, null, confidence)
-        ));
+        Log.i(TAG, "The facesdk model result is: " + isSuspected + " with a score of: " + livenessScore);
+        if (isSuspected) {
+            challengeState.setValue(new ChallengeState.SessionFailed(
+                    new LivenessResult(false, new ArrayList<>(), null, null, null, livenessScore)));
+        } else {
+            challengeState.setValue(new ChallengeState.SessionPassed(
+                    new LivenessResult(true, new ArrayList<>(completedChallenges), null, null, null, livenessScore)
+            ));
+        }
     }
 
     /**

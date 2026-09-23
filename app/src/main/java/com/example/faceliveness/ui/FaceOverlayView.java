@@ -62,7 +62,6 @@ public class FaceOverlayView extends View {
 
     // Reused across onDraw() calls to avoid per-frame allocation (see onDraw / onSizeChanged)
     private final RectF ovalRect = new RectF();
-    private final RectF scaledRect = new RectF();
 
     public FaceOverlayView(Context context) {
         this(context, null);
@@ -191,11 +190,6 @@ public class FaceOverlayView extends View {
 
         // Draw face bounding box if face is detected
         if (face != null && frameWidth > 0 && frameHeight > 0) {
-            RectF faceRectView = mapFrameRectToView(face.getBoundingBox(), frameWidth, frameHeight, rotationDegrees);
-            scaledRect.set(faceRectView);
-
-            canvas.drawRect(scaledRect, showWarningStyle ? warningBoxPaint : boxPaint);
-
             // Spoof warning takes priority over the "too far" prompt, and is
             // drawn regardless of whether a face box is currently present —
             // a spoof verdict can outlast a momentary detection drop.

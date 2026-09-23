@@ -10,7 +10,6 @@ import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
-import androidx.camera.view.PreviewView;
 import androidx.core.content.ContextCompat;
 import androidx.lifecycle.ViewModelProvider;
 
@@ -19,6 +18,7 @@ import com.example.faceliveness.detection.FaceAnalyzer;
 import com.example.faceliveness.model.ChallengeState;
 import com.example.faceliveness.model.LivenessResult;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.kbyai.facesdk.FaceSDK;
 
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -47,6 +47,7 @@ public class LivenessActivity extends AppCompatActivity {
 
         cameraExecutor = Executors.newSingleThreadExecutor();
 
+        setupLivenessSDK();
         setupFaceAnalyzer();
         startCamera();
         observeViewModel();
@@ -60,6 +61,35 @@ public class LivenessActivity extends AppCompatActivity {
             faceAnalyzer.resetAntiSpoof();
             viewModel.startSession(3);
         });
+    }
+
+    private void setupLivenessSDK() {
+        int ret = FaceSDK.setActivation("woFS4W6Js1aGIbXxZpM7NNkSLqCKB3PIjIp8hIm9RcHuiq0UcJkRxFunrcqd5osZyY5hoPGcCN2i\n" +
+                "dsRL+jLIpgSFH3T3KrwJlJtrJQMV9U5nYQVUyyTGeaWxL0BQ1/j9fctI+kQeIKZlJnVIVNVrRaPd\n" +
+                "uSfCR8LmOIntj7sl/qm51yOigi0ZswkBiAT1NqW+otTZzPqWEo9TMKpm7lR9k18+X0tdpFJsWZ5I\n" +
+                "fzFuoTSLpe+sFcyF5c79nBTP7w5p73XFQnRxe2KlwL/fY+Pi255Tzd92a4Q4HKLL93lHYnXJ2Q6R\n" +
+                "p6usjxpBZFJPq41eVphCgiVv+rSDwDc+cfF4AA==");
+
+        if(ret == FaceSDK.SDK_SUCCESS) {
+            Log.i(TAG, "sdk initialized");
+            ret = FaceSDK.init(getAssets());
+        }
+
+        if(ret != FaceSDK.SDK_SUCCESS) {
+            Log.i(TAG, "sdk not initialized");
+            binding.tvInstruction.setVisibility(View.VISIBLE);
+            if(ret == FaceSDK.SDK_LICENSE_KEY_ERROR) {
+                binding.tvInstruction.setText("Invalid license!");
+            } else if(ret == FaceSDK.SDK_LICENSE_APPID_ERROR) {
+                binding.tvInstruction.setText("Invalid error!");
+            } else if(ret == FaceSDK.SDK_LICENSE_EXPIRED) {
+                binding.tvInstruction.setText("License expired!");
+            } else if(ret == FaceSDK.SDK_NO_ACTIVATED) {
+                binding.tvInstruction.setText("No activated!");
+            } else if(ret == FaceSDK.SDK_INIT_ERROR) {
+                binding.tvInstruction.setText("Init error!");
+            }
+        }
     }
 
     private void setupFaceAnalyzer() {
@@ -116,13 +146,10 @@ public class LivenessActivity extends AppCompatActivity {
                 },
                 modelResult -> runOnUiThread(() -> {
                     if (isDestroyed() || isFinishing()) return;
-                    if (!modelResult.isAvailable) {
-                        // Already logged in detail inside MiniFasNetSpoofDetector —
-                        // this is just the UI-facing hand-off.
-                        Log.w(TAG, "Liveness model unavailable: " + modelResult.errorMessage);
-                    }
-                    viewModel.onLivenessModelResult(modelResult.isAvailable, modelResult.livenessScore,
-                            modelResult.errorMessage);
+
+                    Log.w(TAG, "Liveness model result: " + modelResult.reason);
+                    viewModel.onLivenessModelResult(modelResult.isSuspected, modelResult.confidence,
+                            modelResult.reason);
                 })
         );
     }
