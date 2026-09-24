@@ -67,7 +67,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     private final BiConsumer<Face, Boolean> onFaceDetected;
     private final BiConsumer<ChallengeType, Boolean> onChallengeValidated;
     private final Consumer<String> onSpoofDetected;
-    private final Consumer<ScreenReplayDetector.SpoofSignal> onLivenessSnapshotResult;
+    private final Consumer<AISpoofDetector.SpoofModelResult> onLivenessSnapshotResult;
 
     private final FaceDetector detector;
 
@@ -79,7 +79,7 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
     // Second, separate layer of security: a trained model run ONCE on a
     // single snapshot after a deliberate "stay still" moment, rather than a
     // continuous per-frame heuristic. See requestLivenessSnapshot().
-    private final MiniFasNetSpoofDetector spoofModel;
+    private final AISpoofDetector aiSpoofDetector = new AISpoofDetector();
 
     // ML Kit's success listener (where classify() would otherwise be called
     // from) runs on the MAIN thread by default. Running ONNX inference there
@@ -139,12 +139,11 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                         BiConsumer<Face, Boolean> onFaceDetected,
                         BiConsumer<ChallengeType, Boolean> onChallengeValidated,
                         Consumer<String> onSpoofDetected,
-                        Consumer<ScreenReplayDetector.SpoofSignal> onLivenessSnapshotResult) {
+                        Consumer<AISpoofDetector.SpoofModelResult> onLivenessSnapshotResult) {
         this.onFaceDetected = onFaceDetected;
         this.onChallengeValidated = onChallengeValidated;
         this.onSpoofDetected = onSpoofDetected;
         this.onLivenessSnapshotResult = onLivenessSnapshotResult;
-        this.spoofModel = new MiniFasNetSpoofDetector(context);
 
         FaceDetectorOptions options = new FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
@@ -245,6 +244,8 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                             snapshotRequested = false;
 
                             Image image = imageProxy.getImage();
+                            int imageHeight = image.getHeight();
+                            int imageWidth = image.getWidth();
 
                             Image.Plane[] planes = image.getPlanes();
                             ByteBuffer yBuffer = planes[0].getBuffer();
@@ -260,10 +261,12 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                             vBuffer.get(nv21, ySize, vSize);
                             uBuffer.get(nv21, ySize + vSize, uSize);
 
-                            ScreenReplayDetector.SpoofSignal result;
-                            result = screenReplayDetector.classify(nv21, image.getWidth(), image.getHeight());
+                            modelExecutor.execute(() -> {
+                                AISpoofDetector.SpoofModelResult result;
+                                result = aiSpoofDetector.classify(nv21, imageWidth, imageHeight, lastRotationDegrees);
 
-                            onLivenessSnapshotResult.accept(result);
+                                onLivenessSnapshotResult.accept(result);
+                            });
                         }
 
                         // ── Challenge evaluation ────────────────────────────────────
@@ -544,7 +547,6 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
 
     public void shutdown() {
         detector.close();
-        spoofModel.close();
         modelExecutor.shutdown();
     }
 
