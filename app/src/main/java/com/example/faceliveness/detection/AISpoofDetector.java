@@ -47,6 +47,11 @@ public class AISpoofDetector {
     }
 
     public AISpoofDetector.SpoofModelResult classify(byte[] nv21, int width, int height, int lastRotationDegrees) {
+        // 1. Initial basic validation
+        if (nv21 == null || width <= 0 || height <= 0) {
+            return new SpoofModelResult(true, 0f, "Invalid frame input: dimensions or buffer is null", null);
+        }
+
         Bitmap bitmap = FaceSDK.yuv2Bitmap(nv21, width, height, 7);
         List<FaceBox> faceBoxes = FaceSDK.faceDetection(bitmap);
 

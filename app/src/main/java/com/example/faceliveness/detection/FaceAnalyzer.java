@@ -252,6 +252,15 @@ public class FaceAnalyzer implements ImageAnalysis.Analyzer {
                             ByteBuffer uBuffer = planes[1].getBuffer();
                             ByteBuffer vBuffer = planes[2].getBuffer();
 
+                            /*
+                             * In some cases the buffers returned by the yuv planes of image have their cursor at the end
+                             * so the remaining bytes to read becomes 0 which results in an empty nv21 array causing the libcnn.so inside the model to crash.
+                             * So we manually rewind the buffers to their initial position.
+                             */
+                            yBuffer.rewind();
+                            uBuffer.rewind();
+                            vBuffer.rewind();
+
                             int ySize = yBuffer.remaining();
                             int uSize = uBuffer.remaining();
                             int vSize = vBuffer.remaining();
